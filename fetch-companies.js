@@ -104,7 +104,19 @@ const FREE_MAIL = new Set([
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowIST = () =>
   new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
-const log = (...a) => console.log(`[${nowIST()}]`, ...a);
+// Shared live status, shown on the status page (see startStatusServer).
+const STATUS = {
+  startedAt: new Date().toISOString(),
+  phase: "starting",
+  current: null,
+  logs: [],
+};
+const log = (...a) => {
+  const line = `[${nowIST()}] ${a.join(" ")}`;
+  console.log(line);
+  STATUS.logs.push(line);
+  if (STATUS.logs.length > 300) STATUS.logs.shift();
+};
 
 function loadEnvFile(file) {
   if (!fs.existsSync(file)) return;
@@ -231,6 +243,8 @@ class Throttle {
     this.day = readJson(this.file, { date: "", count: 0 });
     this.last = 0;
     this.okStreak = 0;
+    this.avgResponseMs = 2000;
+    this.restingUntil = null;
   }
   today() {
     return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
@@ -243,7 +257,11 @@ class Throttle {
       const msToMidnight = (24 * 3600 - (ist.getHours() * 3600 + ist.getMinutes() * 60 + ist.getSeconds())) * 1000;
       log(`Daily limit of ${this.maxPerDay} requests reached. Resting until after midnight IST ` +
         `(${Math.round(msToMidnight / 60000)} min).`);
+      this.restingUntil = new Date(Date.now() + msToMidnight + 5 * 60 * 1000).toISOString();
+      STATUS.phase = "resting (daily limit)";
       await sleep(msToMidnight + 5 * 60 * 1000);
+      this.restingUntil = null;
+      STATUS.phase = "scanning";
       this.day = { date: this.today(), count: 0 };
     }
     const jitter = this.gap * (0.8 + Math.random() * 0.4);
@@ -285,8 +303,10 @@ async function fetchPage(c, throttle, resource, offset, limit, filters) {
     let wait = Math.min(30 * 60, 60 * 2 ** attempt) * 1000;
     await throttle.wait();
     try {
+      const t0 = Date.now();
       const res = await fetch(url, { signal: AbortSignal.timeout(90000) });
       const text = await res.text();
+      throttle.avgResponseMs = throttle.avgResponseMs * 0.9 + (Date.now() - t0) * 0.1;
       let data = null;
       try { data = JSON.parse(text); } catch { /* not JSON */ }
       if (res.ok && data && Array.isArray(data.records)) {
@@ -590,6 +610,7 @@ async function planJobs(c, throttle, resource) {
   log(`Dataset ${resource}: ${total.toLocaleString("en-IN")} records. Fields: ${fields.join(", ")}`);
 
   let jobs = [{ ...c.filters }];
+  let jobTotals = [total];
   if (c.stateList.length && fields.includes(c.stateField)) {
     log(`  Checking ${c.stateList.length} state names against the dataset...`);
     const perState = [];
@@ -608,16 +629,279 @@ async function planJobs(c, throttle, resource) {
     if (c.filters[c.stateField] === undefined && share < 0.98 && c.stateList === ALL_STATES) {
       log("  Some records use other state spellings, so the whole dataset will be scanned in one pass instead.");
     } else {
-      jobs = perState.filter((p) => p.n).flatMap(({ st }) =>
-        c.districts.length
-          ? c.districts.map((d) => ({ ...c.filters, [c.stateField]: st, District: d }))
-          : [{ ...c.filters, [c.stateField]: st }]);
+      jobs = [];
+      jobTotals = [];
+      for (const { st, n } of perState.filter((p) => p.n)) {
+        if (c.districts.length) {
+          for (const d of c.districts) {
+            jobs.push({ ...c.filters, [c.stateField]: st, District: d });
+            jobTotals.push(null); // district counts aren't known until scanned
+          }
+        } else {
+          jobs.push({ ...c.filters, [c.stateField]: st });
+          jobTotals.push(n);
+        }
+      }
     }
   } else if (c.stateList.length) {
     log(`  This dataset has no "${c.stateField}" field, so it is scanned in one pass (all of India).`);
   }
-  writeJson(planFile, { key, total, jobs });
+  writeJson(planFile, { key, total, jobs, jobTotals, profile: c.profile });
   return jobs;
+}
+
+// ---------------------------------------------------------------------------
+// Live status page (built in, no packages)
+// ---------------------------------------------------------------------------
+// Started when STATUS_PORT is set. Password-protected with STATUS_PASSWORD
+// (browser login box, user name STATUS_USER, default "admin").
+//   /               the page (refreshes itself every 15 s)
+//   /api/status     progress as JSON
+//   /api/leads?from=N  leads from number N on
+//   /leads.csv, /linkedin.csv  downloads
+function buildStatus() {
+  const c = STATUS.config;
+  const t = STATUS.throttle;
+  const progress = readJson(path.join(STATE_DIR, "progress.json"), {});
+  const datasets = [];
+  for (const resource of c.resources) {
+    const plan = readJson(path.join(STATE_DIR, `plan_${resource}.json`), null);
+    if (!plan) { datasets.push({ resource, planned: false, jobs: [] }); continue; }
+    const jobs = plan.jobs.map((filters, i) => {
+      const key = jobKey(c, resource, filters);
+      const p = progress[key] || {};
+      const total = p.total ?? (plan.jobTotals ? plan.jobTotals[i] : null);
+      return {
+        label: Object.keys(filters).length ? Object.values(filters).join(" / ") : "All of India",
+        offset: p.offset || 0,
+        total,
+        done: Boolean(p.done),
+        updated: p.updated || "",
+      };
+    });
+    const total = jobs.reduce((a, j) => a + (j.total || 0), 0) || plan.total || 0;
+    const scanned = jobs.reduce((a, j) => a + (j.done ? (j.total || j.offset) : j.offset), 0);
+    datasets.push({ resource, planned: true, total, scanned, jobs });
+  }
+  const remaining = datasets.reduce((a, d) => a + Math.max(0, (d.total || 0) - (d.scanned || 0)), 0);
+  const perRequestS = (t.gap + t.avgResponseMs) / 1000;
+  const requestsLeft = Math.ceil(remaining / c.pageSize);
+  // Respect the daily cap when estimating.
+  const perDay = c.maxPerDay > 0 ? Math.min(c.maxPerDay, 86400 / perRequestS) : 86400 / perRequestS;
+  const etaHours = (requestsLeft / perDay) * 24;
+  return {
+    now: nowIST(),
+    startedAt: STATUS.startedAt,
+    phase: STATUS.phase,
+    profile: c.profile,
+    current: STATUS.current,
+    leads: STATUS.leads.length,
+    pendingSheet: readJson(path.join(STATE_DIR, "sheet_pending.json"), []).length,
+    requestsToday: t.day.count,
+    maxPerDay: c.maxPerDay,
+    secondsBetweenRequests: +(t.gap / 1000).toFixed(1),
+    avgResponseSeconds: +(t.avgResponseMs / 1000).toFixed(1),
+    restingUntil: t.restingUntil,
+    etaHours: +etaHours.toFixed(1),
+    etaIncomplete: datasets.some((d) => !d.planned), // some datasets not sized yet
+    datasets,
+    logs: STATUS.logs.slice(-40),
+  };
+}
+
+const STATUS_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leads bot status</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2433; --muted:#667085; --line:#e4e7ec; --acc:#2f6fed; --ok:#12a150; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1218; --card:#171b23; --ink:#e7eaf0; --muted:#98a2b3; --line:#2a303b; --acc:#6b9cff; --ok:#35c46f; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:1200px; margin:0 auto; padding:20px; }
+  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:15px; margin:0 0 10px; }
+  .muted { color:var(--muted); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin:16px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .big { font-size:24px; font-weight:650; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; }
+  .bar > span { display:block; height:100%; background:var(--acc); }
+  .bar.done > span { background:var(--ok); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-weight:600; color:var(--muted); font-size:12px; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .section { margin-top:16px; }
+  .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  input[type=search] { flex:1; min-width:200px; padding:7px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); }
+  a.btn { padding:7px 12px; border:1px solid var(--line); border-radius:8px; text-decoration:none; color:var(--ink); background:var(--card); }
+  .scroll { max-height:520px; overflow:auto; }
+  pre { margin:0; font:12px/1.4 ui-monospace,Consolas,monospace; white-space:pre-wrap; max-height:260px; overflow:auto; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:var(--line); font-size:12px; }
+</style></head>
+<body><main>
+  <h1>Leads bot</h1>
+  <div class="muted" id="sub">Loading…</div>
+
+  <div class="grid">
+    <div class="card"><div class="muted">Leads found</div><div class="big" id="k-leads">–</div></div>
+    <div class="card"><div class="muted">Scanned overall</div><div class="big" id="k-pct">–</div><div class="bar"><span id="k-bar" style="width:0"></span></div><div class="muted" id="k-pct-note"></div></div>
+    <div class="card"><div class="muted">Time left (est.)</div><div class="big" id="k-eta">–</div></div>
+    <div class="card"><div class="muted">Requests today</div><div class="big" id="k-req">–</div><div class="muted" id="k-pace"></div></div>
+  </div>
+
+  <div class="card section"><h2>Now</h2><div id="now">–</div></div>
+
+  <div class="card section"><h2>Progress by dataset</h2><div id="datasets"></div></div>
+
+  <div class="card section">
+    <h2>Leads <span class="muted" id="lead-count"></span></h2>
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="Filter by name, district, state…">
+      <a class="btn" href="leads.csv">Download CSV</a>
+      <a class="btn" href="linkedin.csv">LinkedIn upload CSV</a>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Found</th><th>Company</th><th>District</th><th>State</th><th>Pincode</th><th>Activity</th><th>Why matched</th></tr></thead>
+      <tbody id="leads"></tbody>
+    </table></div>
+  </div>
+
+  <div class="card section"><h2>Recent log</h2><pre id="log"></pre></div>
+</main>
+<script>
+const fmt = (n) => n == null ? "?" : Number(n).toLocaleString("en-IN");
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
+const leads = [];
+
+function bar(pct, done) {
+  const b = el("div", null, "bar" + (done ? " done" : ""));
+  const s = el("span"); s.style.width = Math.min(100, pct).toFixed(2) + "%"; b.append(s); return b;
+}
+
+function renderLeads() {
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  const body = document.getElementById("leads");
+  body.replaceChildren();
+  const shown = leads.filter((l) => !q || Object.values(l).join(" ").toLowerCase().includes(q)).slice().reverse();
+  for (const l of shown.slice(0, 2000)) {
+    const tr = el("tr");
+    for (const k of ["Found at (IST)", "Company", "District", "State", "Pincode", "Activity", "Why matched"]) tr.append(el("td", l[k] || ""));
+    body.append(tr);
+  }
+  document.getElementById("lead-count").textContent =
+    "(" + fmt(shown.length) + (q ? " matching" : "") + (shown.length > 2000 ? ", newest 2,000 shown" : "") + ")";
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch("api/status", { cache: "no-store" })).json();
+    document.getElementById("sub").textContent =
+      "Profile " + s.profile + " · " + s.phase + " · updated " + s.now + (s.pendingSheet ? " · " + s.pendingSheet + " waiting for Google Sheet" : "");
+    document.getElementById("k-leads").textContent = fmt(s.leads);
+    const total = s.datasets.reduce((a, d) => a + (d.total || 0), 0);
+    const scanned = s.datasets.reduce((a, d) => a + (d.scanned || 0), 0);
+    const pct = total ? (scanned / total) * 100 : 0;
+    document.getElementById("k-pct").textContent = pct.toFixed(1) + "%";
+    document.getElementById("k-bar").style.width = pct.toFixed(2) + "%";
+    document.getElementById("k-pct-note").textContent = s.etaIncomplete ? "of datasets sized so far" : fmt(scanned) + " of " + fmt(total) + " records";
+    document.getElementById("k-eta").textContent = s.phase === "done" ? "Done" : s.etaHours < 48 ? s.etaHours.toFixed(1) + " h" : (s.etaHours / 24).toFixed(1) + " days";
+    if (s.etaIncomplete && s.phase !== "done") document.getElementById("k-eta").textContent += " +";
+    document.getElementById("k-req").textContent = fmt(s.requestsToday) + (s.maxPerDay ? " / " + fmt(s.maxPerDay) : "");
+    document.getElementById("k-pace").textContent = "1 request every " + s.secondsBetweenRequests + " s, replies in ~" + s.avgResponseSeconds + " s" +
+      (s.restingUntil ? " · resting until " + new Date(s.restingUntil).toLocaleString("en-IN") : "");
+
+    const now = document.getElementById("now");
+    now.replaceChildren();
+    if (s.current) {
+      const c = s.current, p = c.total ? (c.offset / c.total) * 100 : 0;
+      now.append(el("div", c.label + " (" + c.resource.slice(0, 8) + "…): " + fmt(c.offset) + " of " + fmt(c.total) + " records"), bar(p));
+    } else now.append(el("div", s.phase === "done" ? "All datasets finished." : s.phase === "planning" ? "Checking how many records each state has…" : s.phase, "muted"));
+
+    const ds = document.getElementById("datasets");
+    ds.replaceChildren();
+    for (const d of s.datasets) {
+      const box = el("div"); box.style.marginBottom = "18px";
+      const head = el("div"); head.append(el("b", d.resource), " ");
+      if (!d.planned) { head.append(el("span", "not started yet", "pill")); box.append(head); ds.append(box); continue; }
+      const p = d.total ? (d.scanned / d.total) * 100 : 0;
+      head.append(el("span", fmt(d.scanned) + " of " + fmt(d.total) + " (" + p.toFixed(1) + "%)", "muted"));
+      box.append(head, bar(p, p >= 100));
+      const t = el("table"); t.style.marginTop = "8px";
+      const hr = el("tr"); for (const h of ["Part", "Scanned", "Total", "%", "Status"]) hr.append(el("th", h)); t.append(hr);
+      for (const j of d.jobs) {
+        const tr = el("tr");
+        const jp = j.total ? (j.offset / j.total) * 100 : 0;
+        tr.append(el("td", j.label), el("td", fmt(j.offset), "num"), el("td", fmt(j.total), "num"),
+          el("td", j.done ? "100%" : jp.toFixed(1) + "%", "num"),
+          el("td", j.done ? "done" : j.offset ? "in progress" : "waiting"));
+        t.append(tr);
+      }
+      box.append(t); ds.append(box);
+    }
+    document.getElementById("log").textContent = s.logs.join("\\n");
+
+    const more = await (await fetch("api/leads?from=" + leads.length, { cache: "no-store" })).json();
+    if (more.reset) leads.length = 0;
+    leads.push(...more.leads);
+    renderLeads();
+  } catch (e) {
+    document.getElementById("sub").textContent = "Can't reach the bot (" + e.message + "). Retrying…";
+  }
+}
+document.getElementById("q").addEventListener("input", renderLeads);
+refresh(); setInterval(refresh, 15000);
+</script></body></html>`;
+
+function startStatusServer(c) {
+  const port = parseInt(process.env.STATUS_PORT || "0", 10);
+  if (!port) return;
+  const password = process.env.STATUS_PASSWORD || "";
+  const user = process.env.STATUS_USER || "admin";
+  if (!password) {
+    log("STATUS_PORT is set but STATUS_PASSWORD is empty: status page NOT started (it shows lead data).");
+    return;
+  }
+  const http = require("http");
+  const expected = Buffer.from("Basic " + Buffer.from(`${user}:${password}`).toString("base64"));
+  const authorised = (req) => {
+    const got = Buffer.from(req.headers.authorization || "");
+    return got.length === expected.length && crypto.timingSafeEqual(got, expected);
+  };
+  const send = (res, code, type, body, extra = {}) => {
+    res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store", "X-Frame-Options": "DENY", ...extra });
+    res.end(body);
+  };
+
+  const server = http.createServer((req, res) => {
+    if (!authorised(req)) {
+      return send(res, 401, "text/plain", "Login required", { "WWW-Authenticate": 'Basic realm="Leads bot", charset="UTF-8"' });
+    }
+    const url = new URL(req.url, "http://x");
+    try {
+      if (url.pathname === "/") return send(res, 200, "text/html; charset=utf-8", STATUS_PAGE);
+      if (url.pathname === "/api/status") return send(res, 200, "application/json", JSON.stringify(buildStatus()));
+      if (url.pathname === "/api/leads") {
+        const from = Math.max(0, parseInt(url.searchParams.get("from") || "0", 10));
+        const all = STATUS.leads;
+        const reset = from > all.length; // e.g. after --reset
+        return send(res, 200, "application/json", JSON.stringify({ reset, leads: all.slice(reset ? 0 : from) }));
+      }
+      const files = { "/leads.csv": `${c.profile}_leads.csv`, "/linkedin.csv": `${c.profile}_linkedin_upload.csv` };
+      if (files[url.pathname]) {
+        const f = path.join(OUT_DIR, files[url.pathname]);
+        if (!fs.existsSync(f)) return send(res, 404, "text/plain", "No leads yet");
+        return send(res, 200, "text/csv; charset=utf-8", fs.readFileSync(f),
+          { "Content-Disposition": `attachment; filename="${files[url.pathname]}"` });
+      }
+      send(res, 404, "text/plain", "Not found");
+    } catch (e) {
+      send(res, 500, "text/plain", "Error: " + e.message);
+    }
+  });
+  server.on("error", (e) => log(`Status page could not start on port ${port}: ${e.message}`));
+  server.listen(port, "0.0.0.0", () => log(`Status page on port ${port} (login: ${user} / STATUS_PASSWORD).`));
+  STATUS.server = server;
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +921,10 @@ async function main() {
   const leads = readJson(leadsFile, []);
   let pending = readJson(pendingFile, []);
   const seen = new Set(leads.map(leadKey));
+  STATUS.config = c;
+  STATUS.throttle = throttle;
+  STATUS.leads = leads;
+  startStatusServer(c);
 
   log(`Profile "${c.profile}", datasets: ${c.resources.join(", ")}`);
   log(`Pace: one request every ~${(c.delay / 1000).toFixed(1)} s, at most ` +
@@ -675,6 +963,8 @@ async function main() {
 
   for (const resource of c.resources) {
     let jobs;
+    STATUS.phase = "planning";
+    STATUS.current = null;
     try {
       jobs = await planJobs(c, throttle, resource);
     } catch (e) {
@@ -694,11 +984,14 @@ async function main() {
       log(`Job ${label}: starting at record ${offset.toLocaleString("en-IN")}.`);
 
       let total = null;
+      STATUS.phase = "scanning";
+      STATUS.current = { resource, label, offset, total: null };
       try {
         while (offset < end) {
           const limit = Math.min(c.pageSize, end - offset);
           const data = await fetchPage(c, throttle, resource, offset, limit, filters);
           if (total === null) total = Number(data.total) || 0;
+          STATUS.current.total = total;
           const records = data.records || [];
           if (!records.length) break;
 
@@ -729,6 +1022,7 @@ async function main() {
           }
           progress[key] = { offset, done: false, total, updated: nowIST() };
           writeJson(progressFile, progress);
+          STATUS.current.offset = offset;
 
           const pct = total ? ((offset / total) * 100).toFixed(2) : "?";
           const pagesLeft = total ? Math.ceil((total - offset) / c.pageSize) : 0;
@@ -752,6 +1046,9 @@ async function main() {
   writeOutputs(c.profile, leads);
   log(`All jobs done. ${leads.length} lead(s) in output/${c.profile}_leads.csv` +
     (pending.length ? `, ${pending.length} still waiting to be sent to the sheet.` : "."));
+  STATUS.phase = "done";
+  STATUS.current = null;
+  if (STATUS.server) log("Status page keeps running. Stop with Ctrl+C.");
 }
 
 process.on("SIGINT", () => { log("Stopped (progress is saved)."); process.exit(0); });

@@ -124,7 +124,26 @@ Later, to look at it again: `ssh ...` then `tmux attach -t leads`.
 New leads appear in the Google Sheet as they're found, and the log shows
 `NEW LEAD: ...` lines.
 
-## 5. Day to day
+## 5. Live status page
+
+The bot serves a password-protected page with overall progress, an ETA, progress
+per dataset and state, today's request count, a searchable table of all leads,
+CSV downloads and the recent log. It refreshes itself every 15 seconds and keeps
+running after all datasets are done.
+
+1. In `.env` set `STATUS_PORT=8080` and a strong `STATUS_PASSWORD`
+   (e.g. from `openssl rand -hex 12`). User name is `STATUS_USER` (default `admin`).
+2. Restart the bot (`rs` in the tmux window).
+3. Open port 8080: **EC2 → Instances → your instance → Security tab → security
+   group → Edit inbound rules → Add rule**: Custom TCP, port `8080`, source
+   **My IP** (or your office IP). Avoid `0.0.0.0/0` (the whole internet).
+4. Open `http://<instance-public-IP>:8080` and log in.
+
+The page is plain HTTP, so the password travels unencrypted. Keeping the
+security-group rule limited to your own IPs is what keeps it private. For HTTPS
+later, put it behind Nginx + Let's Encrypt or an AWS load balancer.
+
+## 6. Day to day
 
 | Task | How |
 |---|---|
