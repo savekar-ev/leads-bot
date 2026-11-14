@@ -221,10 +221,11 @@ function loadConfig(argv) {
   return c;
 }
 
-// A config mistake: say so and exit. nodemon then waits for you to fix the file.
+// A config mistake: say so and exit with code 2 (pm2 is set not to restart on
+// code 2, so it doesn't loop; fix .env, then `pm2 restart leads-bot`).
 function fatal(msg) {
   console.error(`\nCONFIG ERROR: ${msg}\n`);
-  process.exit(1);
+  process.exit(2);
 }
 
 // ---------------------------------------------------------------------------

@@ -108,25 +108,20 @@ cp .env.example .env
 nano .env              # DATA_GOV_KEY, GOOGLE_WEBHOOK_URL, GOOGLE_WEBHOOK_SECRET
 ```
 
-## 4. Test, then run
+## 4. Run it with pm2 (keeps running after you close the window and after reboots)
 
 ```bash
-# Can the server reach data.gov.in? Should print records, not an error.
-npm run test-api
+sudo npm install -g pm2          # once (drop sudo if Node came from nvm)
+cd ~/leads-bot
+pm2 start ecosystem.config.js    # starts the bot
+pm2 logs leads-bot               # watch it (Ctrl+C only stops watching, not the bot)
+pm2 save                         # remember it
+pm2 startup                      # prints ONE command starting with "sudo env PATH=..."; copy and run it
 ```
 
-Start it so it keeps running after you close the SSH window:
-
-```bash
-tmux new -s leads      # opens a session that survives disconnects
-npm start              # nodemon fetch-companies.js
-# detach: press Ctrl+B, then D   -> now you can close the window
-```
-
-Later, to look at it again: `ssh ...` then `tmux attach -t leads`.
-
-New leads appear in the Google Sheet as they're found, and the log shows
-`NEW LEAD: ...` lines.
+After `pm2 startup` + `pm2 save`, the bot starts again by itself after a reboot
+and continues where it stopped. pm2 also restarts it after a crash (waiting longer
+each time), but not after it finishes or after a `CONFIG ERROR`.
 
 ## 5. Live status page
 
@@ -158,20 +153,19 @@ later, put it behind Nginx + Let's Encrypt or an AWS load balancer.
 
 | Task | How |
 |---|---|
-| See progress | `tmux attach -t leads` (Ctrl+B, D to leave) or `cat state/progress.json` |
-| Update the code | `git pull` in `~/leads-bot`: nodemon restarts it and it resumes |
-| Change states / datasets / speed | Edit `.env`, then in the tmux window type `rs` + Enter |
-| See today's request count | `cat state/requests.json` |
-| Run a finished job again | `node fetch-companies.js --reset` (or delete `state/progress.json`) |
-| Stop | `tmux attach -t leads`, then Ctrl+C |
-| Get CSVs | `output/cpo_leads.csv`, `output/cpo_linkedin_upload.csv` (`scp` them down) |
+| Is it running? | `pm2 status` (or open the status page) |
+| Watch the log | `pm2 logs leads-bot` (Ctrl+C to leave) |
+| Update the code | `cd ~/leads-bot && git pull && pm2 restart leads-bot` (it resumes) |
+| Change settings | `nano .env`, then `pm2 restart leads-bot` |
+| Stop / start | `pm2 stop leads-bot` / `pm2 start leads-bot` |
+| Today's request count | `cat state/requests.json` |
+| Run a finished job again | `pm2 stop leads-bot && node fetch-companies.js --reset`, then Ctrl+C and `pm2 start leads-bot` |
+| Get CSVs | Status page buttons, or `output/cpo_leads.csv` |
 
 Notes:
-- When all datasets are done, the script exits and nodemon shows
-  "clean exit - waiting for changes". That's normal; it isn't stuck.
 - Network errors and rate limits don't stop it: it waits (up to 30 min) and retries.
-- A config mistake (missing key, wrong profile) stops it with `CONFIG ERROR`;
-  fix `.env` and type `rs`.
-- If `npm run test-api` hangs or fails on EC2 but works on your laptop,
-  data.gov.in may be slow or blocking cloud IPs; check the security group
-  allows outbound HTTPS (port 443).
+- A config mistake (missing key, wrong profile) stops it with `CONFIG ERROR` in
+  `pm2 logs`; fix `.env`, then `pm2 restart leads-bot`.
+- Log files are in `logs/`. To keep them small: `pm2 install pm2-logrotate`.
+- If it can't reach data.gov.in from EC2 but works from your laptop, check the
+  security group allows outbound HTTPS (port 443).

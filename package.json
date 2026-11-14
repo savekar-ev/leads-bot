@@ -8,7 +8,11 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "nodemon fetch-companies.js",
+    "start": "pm2 start ecosystem.config.js",
+    "stop": "pm2 stop leads-bot",
+    "restart": "pm2 restart leads-bot",
+    "logs": "pm2 logs leads-bot",
+    "dev": "nodemon fetch-companies.js",
     "once": "node fetch-companies.js",
     "test-api": "node fetch-companies.js --profile raw --max 10 --reset --no-sheet"
   },

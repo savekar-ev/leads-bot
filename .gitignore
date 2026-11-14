@@ -8,3 +8,4 @@ state/
 output/
 *.log
 node_modules/
+logs/
