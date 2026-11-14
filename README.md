@@ -36,36 +36,45 @@ the whole dataset, it scans that dataset in one pass instead, so nothing is miss
 | `package.json`, `nodemon.json` | Run settings | Yes |
 | `.env.example` | Settings template | Yes |
 | `.env` | Your real settings + API key | **No** |
-| `service-account.json` | Google key | **No** |
+| `apps-script.gs` | Paste into the Google Sheet (Extensions → Apps Script) | Yes |
 | `state/`, `output/` | Progress and results | No |
 
-## 1. Google Sheet setup (once, ~10 min)
+## 1. Google Sheet setup (once, ~5 min, no Google Cloud keys)
 
-1. **Create a project**: https://console.cloud.google.com/projectcreate
-   Name it `leads-bot` → **Create**, and make sure it's selected at the top.
-2. **Turn on the Sheets API**:
-   https://console.cloud.google.com/apis/library/sheets.googleapis.com → **Enable**.
-3. **Create a service account** (a robot Google user the script logs in as):
-   https://console.cloud.google.com/iam-admin/serviceaccounts/create
-   Name `leads-bot` → **Create and continue** → skip roles → **Done**.
-4. **Download its key**: in the service-account list, click `leads-bot` →
-   **Keys** tab → **Add key → Create new key → JSON → Create**.
-   A `.json` file downloads. Rename it `service-account.json` and keep it private
-   (never on GitHub, WhatsApp or email).
-   If Google says key creation is disabled by an organisation policy, a Google
-   Workspace admin has to allow it (policy `iam.disableServiceAccountKeyCreation`).
-5. **Create the Sheet**: https://sheets.new → name it e.g. `CPO Leads`,
-   rename the first tab to `Leads`.
-6. **Share it with the robot**: **Share** → paste the service account email
-   (looks like `leads-bot@<project-id>.iam.gserviceaccount.com`; it's also the
-   `client_email` inside the JSON) → **Editor** → untick *Notify* → **Share**.
-   Then share the Sheet with your manager as usual.
-7. **Copy the Sheet ID** from its address bar:
-   `https://docs.google.com/spreadsheets/d/<SHEET_ID>/edit` → put it in `.env`
-   as `GOOGLE_SHEET_ID`.
+The bot sends leads to a small **Apps Script** attached to the sheet, which adds
+the rows. This works even when your Google organisation blocks service-account
+keys.
 
-The script writes the header row itself. Columns *Outreach status*, *Owner* and
-*Notes* are for the team; the script never edits existing rows, it only appends.
+1. Create the sheet: https://sheets.new → name it `CPO Leads`, rename the
+   bottom tab to `Leads`. Share it with your manager as usual.
+2. In the sheet: **Extensions → Apps Script**. Delete what's there, paste the
+   whole of `apps-script.gs` from this repo.
+3. In the pasted code, change `SECRET` to a long random string (e.g. 40 random
+   letters and digits). Click **Save** (disk icon).
+4. **Deploy → New deployment** → gear icon → **Web app**:
+   - Execute as: **Me**
+   - Who has access: **Anyone**
+   → **Deploy** → **Authorize access** → pick your account → if you see
+   "Google hasn't verified this app": **Advanced → Go to … (unsafe) → Allow**
+   (it's your own script).
+5. Copy the **Web app URL** (`https://script.google.com/macros/s/.../exec`).
+   Opening it in a browser should show `{"ok":true,"message":"Leads webhook is running"}`.
+6. In the server's `.env`:
+   ```
+   GOOGLE_WEBHOOK_URL=<the Web app URL>
+   GOOGLE_WEBHOOK_SECRET=<the same SECRET as in step 3>
+   ```
+
+"Anyone" only means anyone with the URL can *call* it; without the secret it
+adds nothing. Keep the URL and secret private. If you change the script later,
+use **Deploy → Manage deployments → Edit → New version** so the URL stays the same.
+
+The header row is written automatically. Columns *Outreach status*, *Owner* and
+*Notes* are for the team; the bot only appends rows, it never edits them.
+
+(Alternative, only if your organisation allows service-account keys: set
+`GOOGLE_SHEET_ID` + `GOOGLE_SERVICE_ACCOUNT_FILE` instead, share the sheet with
+the service account email as Editor.)
 
 ## 2. Code on GitHub
 
@@ -92,16 +101,8 @@ npm install            # installs nodemon locally
 
 # Settings and Google key
 cp .env.example .env
-nano .env              # paste DATA_GOV_KEY and GOOGLE_SHEET_ID
+nano .env              # DATA_GOV_KEY, GOOGLE_WEBHOOK_URL, GOOGLE_WEBHOOK_SECRET
 ```
-
-Copy the Google key from your laptop to the server (run this **on your laptop**):
-
-```bash
-scp -i your-key.pem service-account.json ubuntu@<EC2-IP>:~/leads-bot/
-```
-
-(use `ec2-user@` instead of `ubuntu@` on Amazon Linux)
 
 ## 4. Test, then run
 

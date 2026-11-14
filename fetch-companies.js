@@ -171,6 +171,8 @@ function loadConfig(argv) {
     allStatuses: env.ALL_STATUSES === "true",
     reset: false,
     sheetId: env.GOOGLE_SHEET_ID,
+    webhookUrl: env.GOOGLE_WEBHOOK_URL,
+    webhookSecret: env.GOOGLE_WEBHOOK_SECRET,
     sheetTab: env.GOOGLE_SHEET_TAB || "Leads",
     saFile: env.GOOGLE_SERVICE_ACCOUNT_FILE || "service-account.json",
   };
@@ -191,7 +193,7 @@ function loadConfig(argv) {
       case "--max": c.max = parseInt(take(), 10); break;
       case "--all-statuses": c.allStatuses = true; break;
       case "--reset": c.reset = true; break;
-      case "--no-sheet": c.sheetId = ""; break;
+      case "--no-sheet": c.sheetId = ""; c.webhookUrl = ""; break;
       default: log(`Unknown option ${k} (ignored)`);
     }
   }
@@ -526,6 +528,44 @@ class Sheet {
 }
 
 
+// Same job through a Google Apps Script web app (see apps-script.gs). Needs no
+// Google Cloud keys: the script runs as the sheet's owner and checks a secret.
+class WebhookSheet {
+  constructor(c) {
+    this.url = c.webhookUrl;
+    this.secret = c.webhookSecret || "";
+    this.tab = "Leads";
+    this.enabled = Boolean(this.url);
+    this.saPath = null;
+  }
+
+  async post(rows) {
+    const res = await fetch(this.url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ secret: this.secret, header: LEAD_COLUMNS, rows }),
+      redirect: "follow",
+      signal: AbortSignal.timeout(60000),
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch {
+      throw new Error(`webhook answered ${res.status} with non-JSON (is it deployed with access "Anyone"?): ${text.slice(0, 150).replace(/\s+/g, " ")}`);
+    }
+    if (!data.ok) throw new Error(`webhook refused: ${data.error}`);
+    return data;
+  }
+
+  async ensureHeader() {
+    if (this.enabled) await this.post([]); // writes the header row if the tab is empty
+  }
+
+  async append(leads) {
+    if (!this.enabled || !leads.length) return;
+    await this.post(leads.map((l) => LEAD_COLUMNS.map((col) => (l[col] == null ? "" : String(l[col])))));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Planning: which jobs to run for each dataset
 // ---------------------------------------------------------------------------
@@ -602,12 +642,13 @@ async function main() {
   log(`Pace: one request every ~${(c.delay / 1000).toFixed(1)} s, at most ` +
     `${c.maxPerDay > 0 ? c.maxPerDay.toLocaleString("en-IN") : "unlimited"} requests per day.`);
 
-  const sheet = new Sheet(c);
+  const sheet = c.webhookUrl ? new WebhookSheet(c) : new Sheet(c);
+  if (c.webhookUrl && !c.webhookSecret) fatal("GOOGLE_WEBHOOK_URL is set but GOOGLE_WEBHOOK_SECRET is empty.");
   if (sheet.enabled) {
-    if (!fs.existsSync(sheet.saPath)) fatal(`Service account file not found: ${sheet.saPath}`);
+    if (sheet.saPath && !fs.existsSync(sheet.saPath)) fatal(`Service account file not found: ${sheet.saPath}`);
     try {
       await sheet.ensureHeader();
-      log(`Google Sheet connected (tab "${sheet.tab}").`);
+      log(`Google Sheet connected${c.webhookUrl ? " via Apps Script" : ""} (tab "${sheet.tab}").`);
     } catch (e) {
       log(`Google Sheet not reachable yet: ${e.message}`);
       log("Leads are still saved locally and will be sent once the sheet works.");
@@ -723,4 +764,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { PROFILES, classify, wordRegex, toLead, leadKey, cleanName, parseFilters, Sheet, ALL_STATES };
+module.exports = { PROFILES, classify, wordRegex, toLead, leadKey, cleanName, parseFilters, Sheet, WebhookSheet, ALL_STATES };
