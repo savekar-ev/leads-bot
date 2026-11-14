@@ -3,7 +3,7 @@
 Scans data.gov.in company and MSME data for **all of India** for target companies
 (default: EV charge point operators), appends every new lead to a Google Sheet,
 and keeps CSV copies in `output/`. Progress is saved in `state/`, so after a
-restart (nodemon, reboot, crash) it continues where it stopped.
+restart (pm2, reboot, crash) it continues where it stopped.
 
 ## How long it takes, and why it's slow on purpose
 
@@ -33,7 +33,7 @@ the whole dataset, it scans that dataset in one pass instead, so nothing is miss
 | File | Purpose | On GitHub? |
 |---|---|---|
 | `fetch-companies.js` | The script | Yes |
-| `package.json`, `nodemon.json` | Run settings | Yes |
+| `package.json`, `ecosystem.config.js` | Run settings (pm2) | Yes |
 | `.env.example` | Settings template | Yes |
 | `.env` | Your real settings + API key | **No** |
 | `apps-script.gs` | Paste into the Google Sheet (Extensions → Apps Script) | Yes |
@@ -95,13 +95,13 @@ SSH in, then:
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
 source ~/.bashrc
 nvm install 20
-sudo apt-get install -y git tmux 2>/dev/null || sudo yum install -y git tmux
+sudo apt-get install -y git 2>/dev/null || sudo yum install -y git
 
 # Get the code (private repo: use a GitHub personal access token as the password,
 # or add the server's SSH key as a read-only Deploy Key on the repo)
 git clone https://github.com/savekar-ev/leads-bot.git
 cd leads-bot
-npm install            # installs nodemon locally
+npm install
 
 # Settings and Google key
 cp .env.example .env
@@ -132,7 +132,7 @@ running after all datasets are done.
 
 1. In `.env` set `STATUS_PORT=8080` and a strong `STATUS_PASSWORD`
    (e.g. from `openssl rand -hex 12`). User name is `STATUS_USER` (default `admin`).
-2. Restart the bot (`rs` in the tmux window).
+2. Restart the bot: `pm2 restart leads-bot`.
 3. Open port 8080: **EC2 → Instances → your instance → Security tab → security
    group → Edit inbound rules → Add rule**: Custom TCP, port `8080`, source
    **My IP** (or your office IP). Avoid `0.0.0.0/0` (the whole internet).
