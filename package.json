@@ -1,0 +1,18 @@
+{
+  "name": "leads-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Finds EV charge point operators (and other targets) in data.gov.in company/MSME data and sends new leads to a Google Sheet.",
+  "main": "fetch-companies.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "nodemon fetch-companies.js",
+    "once": "node fetch-companies.js",
+    "test-api": "node fetch-companies.js --profile raw --max 10 --reset --no-sheet"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}

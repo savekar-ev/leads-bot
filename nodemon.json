@@ -1,0 +1,6 @@
+{
+  "watch": ["fetch-companies.js"],
+  "ext": "js",
+  "ignore": ["state/*", "output/*", "*.log", "node_modules/*"],
+  "delay": 2000
+}

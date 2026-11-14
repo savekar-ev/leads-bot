@@ -1,0 +1,10 @@
+# secrets
+.env
+service-account.json
+*.pem
+
+# generated
+state/
+output/
+*.log
+node_modules/
