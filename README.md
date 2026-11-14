@@ -39,7 +39,11 @@ the whole dataset, it scans that dataset in one pass instead, so nothing is miss
 | `apps-script.gs` | Paste into the Google Sheet (Extensions → Apps Script) | Yes |
 | `state/`, `output/` | Progress and results | No |
 
-## 1. Google Sheet setup (once, ~5 min, no Google Cloud keys)
+## 1. Google Sheet setup (optional)
+
+You can skip this whole section: every lead is saved on the server and shown on
+the live status page (section 5), with CSV download buttons. Set it up only if
+you also want leads copied into a Google Sheet.
 
 The bot sends leads to a small **Apps Script** attached to the sheet, which adds
 the rows. This works even when your Google organisation blocks service-account
@@ -138,6 +142,13 @@ running after all datasets are done.
    group → Edit inbound rules → Add rule**: Custom TCP, port `8080`, source
    **My IP** (or your office IP). Avoid `0.0.0.0/0` (the whole internet).
 4. Open `http://<instance-public-IP>:8080` and log in.
+
+**Where the data lives (no data loss):** every new lead is written to
+`state/cpo_leads.json` (written atomically, so a crash can't leave it half
+written) *before* anything else happens, and `output/cpo_leads.csv` is rebuilt
+from it. A copy is kept per day in `state/backups/` (last 30 days). The page and
+the CSV buttons only read this data; they never change it. Leads survive
+restarts, `git pull` and reboots; only deleting the `state/` folder removes them.
 
 The page is plain HTTP, so the password travels unencrypted. Keeping the
 security-group rule limited to your own IPs is what keeps it private. For HTTPS

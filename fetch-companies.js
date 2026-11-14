@@ -587,6 +587,23 @@ class WebhookSheet {
 }
 
 // ---------------------------------------------------------------------------
+// Backups: one copy of the leads file per day in state/backups (last 30 kept),
+// so even a deleted or damaged leads file can be restored.
+// ---------------------------------------------------------------------------
+function backupLeads(profileName, leadsFile) {
+  try {
+    const dir = path.join(STATE_DIR, "backups");
+    fs.mkdirSync(dir, { recursive: true });
+    const day = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+    fs.copyFileSync(leadsFile, path.join(dir, `${profileName}_leads_${day}.json`));
+    const old = fs.readdirSync(dir).filter((f) => f.startsWith(`${profileName}_leads_`)).sort();
+    for (const f of old.slice(0, -30)) fs.unlinkSync(path.join(dir, f));
+  } catch (e) {
+    log(`Backup failed (${e.message}); the main leads file is unaffected.`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Planning: which jobs to run for each dataset
 // ---------------------------------------------------------------------------
 const jobKey = (c, resource, filters) => {
@@ -1013,6 +1030,7 @@ async function main() {
             leads.push(...fresh);
             if (sheet.enabled) pending.push(...fresh);
             writeJson(leadsFile, leads);
+            backupLeads(c.profile, leadsFile);
             writeJson(pendingFile, pending);
             writeOutputs(c.profile, leads);
             for (const l of fresh) {
