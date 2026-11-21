@@ -159,7 +159,7 @@ running after all datasets are done.
 **Where the data lives (no data loss):** every new lead is written to
 `state/cpo_leads.json` (written atomically, so a crash can't leave it half
 written) *before* anything else happens, and `output/cpo_leads.csv` is rebuilt
-from it. A copy is kept per day in `state/backups/` (last 30 days). The page and
+from it. A gzipped copy is kept per day in `state/backups/` (never deleted). The page and
 the CSV buttons only read this data; they never change it. Leads survive
 restarts, `git pull` and reboots; only deleting the `state/` folder removes them.
 

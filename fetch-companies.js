@@ -749,17 +749,18 @@ class WebhookSheet {
 }
 
 // ---------------------------------------------------------------------------
-// Backups: one copy of the leads file per day in state/backups (last 30 kept),
-// so even a deleted or damaged leads file can be restored.
+// Backups: one gzipped copy of the leads file per day in state/backups, kept
+// forever (nothing is ever deleted), so even a deleted or damaged leads file can
+// be restored. Older plain .json backups are left as they are.
 // ---------------------------------------------------------------------------
 function backupLeads(profileName, leadsFile) {
   try {
     const dir = path.join(STATE_DIR, "backups");
     fs.mkdirSync(dir, { recursive: true });
     const day = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
-    fs.copyFileSync(leadsFile, path.join(dir, `${profileName}_leads_${day}.json`));
-    const old = fs.readdirSync(dir).filter((f) => f.startsWith(`${profileName}_leads_`)).sort();
-    for (const f of old.slice(0, -30)) fs.unlinkSync(path.join(dir, f));
+    const file = path.join(dir, `${profileName}_leads_${day}.json.gz`);
+    fs.writeFileSync(`${file}.tmp`, zlib.gzipSync(fs.readFileSync(leadsFile)));
+    fs.renameSync(`${file}.tmp`, file);
   } catch (e) {
     log(`Backup failed (${e.message}); the main leads file is unaffected.`);
   }
@@ -1100,6 +1101,30 @@ async function main() {
   const leads = readJson(leadsFile, []);
   let pending = readJson(pendingFile, []);
   const seen = new Set(leads.map(leadKey));
+
+  // Nothing found earlier is lost when switching profile: the broad profile
+  // covers every other one, so leads found before with cpo / ev / energy are
+  // carried into the broad files (once, de-duplicated). The old files are left
+  // untouched. They were already sent to the Google Sheet, so not sent again.
+  if (c.profile === "broad") {
+    let carried = 0;
+    for (const f of fs.readdirSync(STATE_DIR)) {
+      const m = f.match(/^(.+)_leads\.json$/);
+      if (!m || m[1] === "broad" || m[1] === "raw") continue;
+      for (const l of readJson(path.join(STATE_DIR, f), [])) {
+        const k = leadKey(l);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        leads.push(l);
+        carried++;
+      }
+    }
+    if (carried) {
+      writeJson(leadsFile, leads);
+      writeOutputs(c.profile, leads);
+      log(`Carried ${carried} earlier lead(s) (from other profiles) into ${c.profile}_leads.`);
+    }
+  }
   STATUS.config = c;
   STATUS.throttle = throttle;
   STATUS.leads = leads;
