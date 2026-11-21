@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Lead finder: pulls company / MSME records from data.gov.in for all of India,
- * keeps the ones that fit a target profile (default: EV charge point operators), and
+ * keeps the ones that fit a target profile (default "broad": EV charging, EVs,
+ * battery/BMS, solar/renewables, energy tech; solar-only companies included), and
  *   - appends each new lead to a Google Sheet (so the team can track outreach)
  *   - keeps local CSVs in ./output
  *   - remembers its progress in ./state, so a restart (nodemon, reboot, crash)
@@ -14,17 +15,19 @@
  *
  * Configuration comes from a .env file next to this script (see .env.example).
  * Command-line options override it:
- *   --key KEY  --resource ID[,ID]  --profile cpo|ev|energy|raw
+ *   --key KEY  --resource ID[,ID]  --profile broad|cpo|ev|energy|raw
  *   --states ALL|NONE|MAHARASHTRA,KARNATAKA  --districts PUNE,THANE
  *   --filter Field=Value[;Field=Value]  --page-size N  --delay SECONDS  --max N
  *   --all-statuses
  *   --reset     forget saved progress and plans, start from the beginning
  *   --no-sheet  don't send anything to Google Sheets (for tests)
+ *   --export-raw  write everything saved in state/raw to output/raw_<dataset>.csv, then exit
  */
 
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const zlib = require("zlib");
 
 const ROOT = __dirname;
 const STATE_DIR = path.join(ROOT, "state");
@@ -92,6 +95,60 @@ const PROFILES = {
   // No filter: every record is kept. Handy as quick proof the API works.
   raw: { nic: {}, words: [], requireName: false, keepAll: true },
 };
+
+// Broad (the default): anything in the EV + clean-energy space. A company only has
+// to match ONE group, so solar-only or battery-only companies with nothing to do
+// with EV charging are kept too. "Why matched" starts with the group(s), e.g.
+// "[Solar / renewable] matched: solar". Name or activity text must match (the NIC
+// code alone would pull in every software / electrical company).
+const BROAD_GROUPS = {
+  "EV charging": PROFILES.cpo.words,
+  "EV / e-mobility": PROFILES.ev.words,
+  "Battery / BMS / storage": [
+    "battery", "batteries", "energy storage", "bess", "lithium", "li-ion",
+    "lithium ion", "bms", "battery management",
+  ],
+  "Solar / renewable": [
+    "solar", "solar energy", "solar power", "photovoltaic", "rooftop solar",
+    "renewable", "renewables", "renewable energy", "green energy", "clean energy",
+    "wind energy", "green hydrogen",
+  ],
+  "Energy tech / management": [
+    "power electronics", "energy management", "ems", "smart grid", "microgrid",
+    "inverter", "inverters", "cleantech", "energy solutions", "energy efficiency",
+    "esco", "smart meter", "smart meters", "electrification",
+  ],
+  "Power / energy (general)": [
+    "energy", "energies", "electric power", "power generation", "power plant",
+    "power plants", "power project", "power projects", "power systems",
+    "power solutions", "power infra", "power infrastructure", "power transmission",
+    "power distribution", "transmission line", "switchgear", "transformer",
+    "transformers", "ups", "genset", "gensets", "generator", "generators",
+    "wind energy", "wind power", "wind turbine", "wind turbines", "hydro power",
+    "hydropower", "hydel", "hydroelectric", "biogas", "biomass", "bio energy",
+    "bioenergy", "waste to energy", "hydrogen", "fuel cell", "fuel cells",
+  ],
+};
+// Industry codes that are energy by definition: a company with one of these
+// qualifies even if its name/activity text has none of the words above.
+// (From the CIN for MCA companies, from NIC5DigitId in Activities for MSME.)
+const BROAD_STRONG_NIC = {
+  "2720": "Batteries & accumulators",
+  "3510": "Electric power generation, transmission & distribution",
+};
+{
+  const words = [], wordGroup = [];
+  for (const [g, ws] of Object.entries(BROAD_GROUPS)) {
+    for (const w of ws) { words.push(w); wordGroup.push(g); }
+  }
+  PROFILES.broad = {
+    nic: { ...PROFILES.ev.nic, ...PROFILES.energy.nic },
+    strongNic: BROAD_STRONG_NIC,
+    words,
+    wordGroup,
+    requireName: true,
+  };
+}
 
 const FREE_MAIL = new Set([
   "gmail.com", "yahoo.com", "yahoo.co.in", "hotmail.com", "outlook.com",
@@ -171,7 +228,8 @@ function loadConfig(argv) {
   const c = {
     key: env.DATA_GOV_KEY,
     resources: list(env.RESOURCE_IDS || env.RESOURCE_ID),
-    profile: env.PROFILE || "cpo",
+    profile: env.PROFILE || "broad",
+    rawStore: env.RAW_STORE !== "off",
     filters: parseFilters(env.FILTERS),
     states: env.STATES === undefined ? "ALL" : env.STATES,
     stateField: env.STATE_FIELD || "State",
@@ -339,6 +397,81 @@ async function fetchPage(c, throttle, resource, offset, limit, filters) {
 }
 
 // ---------------------------------------------------------------------------
+// Raw store: every page the API returns, unfiltered, gzipped, in state/raw/.
+// A later run (another profile, --reset, a restart) reads the page from disk
+// instead of calling data.gov.in again. RAW_STORE=off in .env turns it off.
+// Delete state/raw/ to force fresh downloads.
+// ---------------------------------------------------------------------------
+const RAW_DIR = path.join(STATE_DIR, "raw");
+const MIN_FREE_DISK = 2 * 1024 ** 3; // stop saving raw pages below 2 GB free
+let rawDiskWarned = false;
+
+function rawFile(resource, filters, offset, limit) {
+  const f = Object.entries(filters).sort().map(([k, v]) => `${k}=${v}`).join("&");
+  const part = f ? f.replace(/[^a-z0-9=&_-]+/gi, "_") : "all";
+  return path.join(RAW_DIR, resource, part, `page_${offset}_${limit}.json.gz`);
+}
+
+function diskHasRoom() {
+  try {
+    const s = fs.statfsSync(STATE_DIR);
+    return s.bavail * s.bsize > MIN_FREE_DISK;
+  } catch { return true; } // statfs not available: don't block
+}
+
+async function getPage(c, throttle, resource, offset, limit, filters) {
+  const file = rawFile(resource, filters, offset, limit);
+  if (c.rawStore && fs.existsSync(file)) {
+    try {
+      return { data: JSON.parse(zlib.gunzipSync(fs.readFileSync(file)).toString("utf8")), cached: true };
+    } catch { /* damaged file: download it again */ }
+  }
+  const data = await fetchPage(c, throttle, resource, offset, limit, filters);
+  if (c.rawStore && data.records.length) {
+    if (diskHasRoom()) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(`${file}.tmp`, zlib.gzipSync(JSON.stringify(data)));
+      fs.renameSync(`${file}.tmp`, file);
+    } else if (!rawDiskWarned) {
+      rawDiskWarned = true;
+      log("Less than 2 GB disk left: no longer saving raw pages (scanning and leads continue).");
+    }
+  }
+  return { data, cached: false };
+}
+
+// `node fetch-companies.js --export-raw`: everything in state/raw as one CSV per
+// dataset in output/raw_<dataset>.csv (streamed, so it works for crores of rows;
+// too big for Excel, open with a database or split it).
+function exportRaw() {
+  if (!fs.existsSync(RAW_DIR)) { console.log("Nothing stored yet in state/raw."); return; }
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const pageNum = (f) => parseInt(f.split("_")[1], 10);
+  for (const resource of fs.readdirSync(RAW_DIR)) {
+    const out = path.join(OUT_DIR, `raw_${resource}.csv`);
+    const fd = fs.openSync(out, "w");
+    let cols = null, n = 0;
+    for (const part of fs.readdirSync(path.join(RAW_DIR, resource)).sort()) {
+      const dir = path.join(RAW_DIR, resource, part);
+      const pages = fs.readdirSync(dir).filter((f) => f.endsWith(".json.gz")).sort((a, b) => pageNum(a) - pageNum(b));
+      for (const p of pages) {
+        const data = JSON.parse(zlib.gunzipSync(fs.readFileSync(path.join(dir, p))).toString("utf8"));
+        for (const rec of data.records || []) {
+          if (!cols) {
+            cols = Object.keys(rec);
+            fs.writeSync(fd, "﻿" + cols.map(csvCell).join(",") + "\r\n");
+          }
+          fs.writeSync(fd, cols.map((k) => csvCell(rec[k])).join(",") + "\r\n");
+          n++;
+        }
+      }
+    }
+    fs.closeSync(fd);
+    console.log(`${n.toLocaleString("en-IN")} records -> ${out}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Matching
 // ---------------------------------------------------------------------------
 function findField(rec, ...candidates) {
@@ -367,26 +500,54 @@ function activityText(rec) {
   return raw;
 }
 
+// Industry (NIC) codes of a record: from the CIN (MCA) and from the MSME
+// Activities list (NIC5DigitId).
+function nicCodes(rec) {
+  const codes = [];
+  const cin = findField(rec, "corporate_identification", "corporateidentification", "cin").trim().toUpperCase();
+  if (/^[LU]\d{5}/.test(cin)) codes.push(cin.slice(1, 6));
+  try {
+    const acts = JSON.parse(findField(rec, "activit"));
+    if (Array.isArray(acts)) {
+      for (const a of acts) {
+        const id = String(a.NIC5DigitId || a.nic5digitid || "").trim();
+        if (/^\d{4,5}$/.test(id)) codes.push(id);
+      }
+    }
+  } catch { /* no activities list */ }
+  return [...new Set(codes)];
+}
+
 const companyName = (rec) => findField(rec, "company_name", "companyname", "enterprisename", "name");
 
 function classify(rec, profile, wordRes) {
   if (profile.keepAll) return ["raw (unfiltered)"];
   const nicHits = [];
-  const cin = findField(rec, "corporate_identification", "cin").trim().toUpperCase();
-  if (/^[LU]\d{5}/.test(cin)) {
-    const nic = cin.slice(1, 6);
+  const strongHits = [];
+  for (const nic of nicCodes(rec)) {
     for (const [p, label] of Object.entries(profile.nic)) {
       if (nic.startsWith(p)) nicHits.push(`NIC ${nic}: ${label}`);
     }
+    for (const [p, label] of Object.entries(profile.strongNic || {})) {
+      if (nic.startsWith(p)) strongHits.push(label);
+    }
   }
   const text = `${companyName(rec)} ${activityText(rec)}`;
-  const nameHits = profile.words.filter((w, i) => wordRes[i].test(text));
-  if (profile.requireName && !nameHits.length) return [];
+  const hitIdx = [];
+  profile.words.forEach((w, i) => { if (wordRes[i].test(text)) hitIdx.push(i); });
+  const nameHits = hitIdx.map((i) => profile.words[i]);
+  if (profile.requireName && !nameHits.length && !strongHits.length) return [];
   const lower = text.toLowerCase();
   if ((profile.exclude || []).some((x) => lower.includes(x)) &&
       !/station|hub|network|operat|plaza/.test(lower)) return [];
-  const reasons = [...nicHits];
-  if (nameHits.length) reasons.push(`matched: ${nameHits.join(", ")}`);
+  const reasons = [];
+  if (profile.wordGroup) {
+    const groups = new Set(hitIdx.map((i) => profile.wordGroup[i]));
+    if (strongHits.length) groups.add("Power / energy (industry code)");
+    if (groups.size) reasons.push(`[${[...groups].join(", ")}]`);
+  }
+  reasons.push(...new Set(nicHits));
+  if (nameHits.length) reasons.push(`matched: ${[...new Set(nameHits)].join(", ")}`);
   return reasons;
 }
 
@@ -409,7 +570,7 @@ function toLead(rec, reasons, resource) {
     Pincode: findField(rec, "pincode", "pin_code"),
     "Registration date": findField(rec, "registrationdate", "date_of_registration", "registration_date", "incorporation"),
     Address: findField(rec, "address").slice(0, 300),
-    CIN: findField(rec, "corporate_identification", "cin"),
+    CIN: findField(rec, "corporate_identification", "corporateidentification", "cin"),
     Email: findField(rec, "email"),
     "Why matched": reasons.join(" | "),
     "Source dataset": resource,
@@ -963,6 +1124,26 @@ async function main() {
     log("No Google Sheet set: leads are saved to ./output only.");
   }
 
+  // Saving: leads first, then progress (so progress never runs ahead of saved
+  // leads). With many leads (broad profile) rewriting the files after every page
+  // gets slow, so new leads are saved at most once a minute; pages scanned since
+  // the last save are simply scanned again after a crash (from state/raw, free).
+  const SAVE_EVERY_MS = 60 * 1000;
+  let unsaved = false;
+  let lastSave = Date.now();
+  const saveFiles = () => {
+    if (unsaved) {
+      writeJson(leadsFile, leads);
+      backupLeads(c.profile, leadsFile);
+      writeJson(pendingFile, pending);
+      writeOutputs(c.profile, leads);
+      unsaved = false;
+    }
+    writeJson(progressFile, progress);
+    lastSave = Date.now();
+  };
+  saveOnExit = saveFiles;
+
   const flushSheet = async () => {
     if (!sheet.enabled || !pending.length) return;
     try {
@@ -1007,7 +1188,7 @@ async function main() {
       try {
         while (offset < end) {
           const limit = Math.min(c.pageSize, end - offset);
-          const data = await fetchPage(c, throttle, resource, offset, limit, filters);
+          const { data, cached } = await getPage(c, throttle, resource, offset, limit, filters);
           if (total === null) total = Number(data.total) || 0;
           STATUS.current.total = total;
           const records = data.records || [];
@@ -1030,24 +1211,24 @@ async function main() {
           if (fresh.length) {
             leads.push(...fresh);
             if (sheet.enabled) pending.push(...fresh);
-            writeJson(leadsFile, leads);
-            backupLeads(c.profile, leadsFile);
-            writeJson(pendingFile, pending);
-            writeOutputs(c.profile, leads);
+            unsaved = true;
             for (const l of fresh) {
               log(`  NEW LEAD: ${l.Company} (${[l.District, l.State].filter(Boolean).join(", ") || "?"}) ${l["Why matched"]}`);
             }
-            await flushSheet();
           }
           progress[key] = { offset, done: false, total, updated: nowIST() };
-          writeJson(progressFile, progress);
+          if (!unsaved || Date.now() - lastSave >= SAVE_EVERY_MS) {
+            const hadLeads = unsaved;
+            saveFiles();
+            if (hadLeads) await flushSheet();
+          }
           STATUS.current.offset = offset;
 
           const pct = total ? ((offset / total) * 100).toFixed(2) : "?";
           const pagesLeft = total ? Math.ceil((total - offset) / c.pageSize) : 0;
           const hoursLeft = (pagesLeft * (throttle.gap / 1000 + 2)) / 3600;
-          log(`  ${label}: ${offset.toLocaleString("en-IN")} of ${total.toLocaleString("en-IN")} (${pct}%), ` +
-            `leads so far ${leads.length}, ~${hoursLeft.toFixed(1)} h left in this job`);
+          log(`  ${label}: ${offset.toLocaleString("en-IN")} of ${total.toLocaleString("en-IN")} (${pct}%)` +
+            `${cached ? " [from state/raw]" : ""}, leads so far ${leads.length}, ~${hoursLeft.toFixed(1)} h left in this job`);
         }
       } catch (e) {
         if (e instanceof SkipResource) { log(`Skipping rest of dataset: ${e.message}`); break; }
@@ -1056,7 +1237,9 @@ async function main() {
 
       const finished = c.max === Infinity;
       progress[key] = { offset, done: finished, total, updated: nowIST() };
-      writeJson(progressFile, progress);
+      const hadLeads = unsaved;
+      saveFiles();
+      if (hadLeads) await flushSheet();
       log(finished ? `Finished ${label}.` : `Stopped at --max for ${label}.`);
     }
   }
@@ -1070,10 +1253,17 @@ async function main() {
   if (STATUS.server) log("Status page keeps running. Stop with Ctrl+C.");
 }
 
-process.on("SIGINT", () => { log("Stopped (progress is saved)."); process.exit(0); });
-process.on("SIGTERM", () => { log("Stopped (progress is saved)."); process.exit(0); });
+let saveOnExit = null; // set by main(): writes unsaved leads + progress
+const stop = () => {
+  try { if (saveOnExit) saveOnExit(); } catch (e) { console.error(`Save on stop failed: ${e.message}`); }
+  log("Stopped (progress is saved).");
+  process.exit(0);
+};
+process.on("SIGINT", stop);
+process.on("SIGTERM", stop);
 
 if (require.main === module) {
+  if (process.argv.includes("--export-raw")) { exportRaw(); process.exit(0); }
   main().catch((e) => {
     console.error(e);
     process.exit(1);

@@ -1,7 +1,10 @@
 # Leads bot
 
 Scans data.gov.in company and MSME data for **all of India** for target companies
-(default: EV charge point operators), appends every new lead to a Google Sheet,
+(default profile `broad`: the whole energy sector, i.e. EV charging, EVs, battery /
+BMS / storage, solar / renewables, energy management, power generation and
+equipment, wind, hydro, bio-energy, hydrogen; a company only has to match one of
+these), appends every new lead to a Google Sheet,
 and keeps CSV copies in `output/`. Progress is saved in `state/`, so after a
 restart (pm2, reboot, crash) it continues where it stopped.
 
@@ -27,6 +30,21 @@ raises the risk of being blocked.
 Before scanning a dataset, the script asks it how many records each state has
 (36 tiny requests, saved so they aren't repeated). If the state names don't cover
 the whole dataset, it scans that dataset in one pass instead, so nothing is missed.
+
+## Profiles and the raw store
+
+`PROFILE` in `.env` picks what counts as a lead. `broad` (default) keeps any
+energy company; *Why matched* starts with the group, e.g. `[Solar / renewable]`
+or `[Battery / BMS / storage]`, so the list can be filtered later. Companies whose
+official industry code is batteries (NIC 2720) or electric power (NIC 3510) are
+kept even if their name doesn't say so. `cpo` keeps only charge point operators.
+
+Every page downloaded is also saved, unfiltered and gzipped, in `state/raw/`.
+Changing `PROFILE` (or `--reset`) re-scans from these files without calling
+data.gov.in again. To get everything stored as CSV:
+`node fetch-companies.js --export-raw` (writes `output/raw_<dataset>.csv`; MSME is
+far too big for Excel). Saving stops by itself if the disk has under 2 GB free;
+`RAW_STORE=off` turns it off.
 
 ## Files
 
