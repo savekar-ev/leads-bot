@@ -28,6 +28,10 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const zlib = require("zlib");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
+const { promisify } = require("util");
+const gunzip = promisify(zlib.gunzip);
 
 const ROOT = __dirname;
 const STATE_DIR = path.join(ROOT, "state");
@@ -405,6 +409,8 @@ async function fetchPage(c, throttle, resource, offset, limit, filters) {
 const RAW_DIR = path.join(STATE_DIR, "raw");
 const MIN_FREE_DISK = 2 * 1024 ** 3; // stop saving raw pages below 2 GB free
 let rawDiskWarned = false;
+const EMPTY_PAGE_RETRIES = 3;
+const EMPTY_PAGE_WAIT_MS = Number(process.env.EMPTY_PAGE_RETRY_SECONDS || 60) * 1000;
 
 function rawFile(resource, filters, offset, limit) {
   const f = Object.entries(filters).sort().map(([k, v]) => `${k}=${v}`).join("&");
@@ -440,34 +446,59 @@ async function getPage(c, throttle, resource, offset, limit, filters) {
   return { data, cached: false };
 }
 
-// `node fetch-companies.js --export-raw`: everything in state/raw as one CSV per
-// dataset in output/raw_<dataset>.csv (streamed, so it works for crores of rows;
-// too big for Excel, open with a database or split it).
-function exportRaw() {
-  if (!fs.existsSync(RAW_DIR)) { console.log("Nothing stored yet in state/raw."); return; }
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  const pageNum = (f) => parseInt(f.split("_")[1], 10);
-  for (const resource of fs.readdirSync(RAW_DIR)) {
-    const out = path.join(OUT_DIR, `raw_${resource}.csv`);
-    const fd = fs.openSync(out, "w");
-    let cols = null, n = 0;
-    for (const part of fs.readdirSync(path.join(RAW_DIR, resource)).sort()) {
-      const dir = path.join(RAW_DIR, resource, part);
-      const pages = fs.readdirSync(dir).filter((f) => f.endsWith(".json.gz")).sort((a, b) => pageNum(a) - pageNum(b));
-      for (const p of pages) {
-        const data = JSON.parse(zlib.gunzipSync(fs.readFileSync(path.join(dir, p))).toString("utf8"));
-        for (const rec of data.records || []) {
-          if (!cols) {
-            cols = Object.keys(rec);
-            fs.writeSync(fd, "﻿" + cols.map(csvCell).join(",") + "\r\n");
-          }
-          fs.writeSync(fd, cols.map((k) => csvCell(rec[k])).join(",") + "\r\n");
-          n++;
+const RAW_LABELS = {
+  "4dbe5667-7b6b-41d7-82af-211562424d9a": "MCA companies",
+  "8b68ae56-84cf-4728-a0a6-1be11028dea7": "MSME Udyam",
+};
+function rawDatasets() {
+  try {
+    return fs.readdirSync(RAW_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => ({ resource: d.name, label: RAW_LABELS[d.name] || d.name }));
+  } catch { return []; }
+}
+
+// Every saved record of a dataset as CSV text, a page at a time (works for crores
+// of rows without loading them into memory, and doesn't block the scan).
+async function* rawCsvChunks(resource) {
+  const base = path.join(RAW_DIR, resource);
+  let cols = null;
+  for (const part of (await fs.promises.readdir(base)).sort()) {
+    const dir = path.join(base, part);
+    const pages = (await fs.promises.readdir(dir))
+      .map((file) => ({ file, m: file.match(/^page_(\d+)_(\d+)\.json\.gz$/) }))
+      .filter((x) => x.m)
+      .map((x) => ({ file: x.file, offset: Number(x.m[1]) }))
+      .sort((x, y) => x.offset - y.offset);
+    let covered = 0; // pages saved with a different PAGE_SIZE may overlap
+    for (const page of pages) {
+      const raw = await gunzip(await fs.promises.readFile(path.join(dir, page.file)));
+      const records = JSON.parse(raw.toString("utf8")).records || [];
+      const fresh = records.slice(Math.max(0, covered - page.offset));
+      covered = Math.max(covered, page.offset + records.length);
+      let chunk = "";
+      for (const rec of fresh) {
+        if (!cols) {
+          cols = Object.keys(rec);
+          chunk += "﻿" + cols.map(csvCell).join(",") + "\r\n";
         }
+        chunk += cols.map((k) => csvCell(rec[k])).join(",") + "\r\n";
       }
+      if (chunk) yield chunk;
     }
-    fs.closeSync(fd);
-    console.log(`${n.toLocaleString("en-IN")} records -> ${out}`);
+  }
+}
+
+// `node fetch-companies.js --export-raw`: everything in state/raw as one CSV per
+// dataset in output/raw_<dataset>.csv (too big for Excel; use a database or split it).
+async function exportRaw() {
+  const sets = rawDatasets();
+  if (!sets.length) { console.log("Nothing stored yet in state/raw."); return; }
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  for (const { resource } of sets) {
+    const out = path.join(OUT_DIR, `raw_${resource}.csv`);
+    await pipeline(Readable.from(rawCsvChunks(resource)), fs.createWriteStream(out));
+    console.log(`Saved ${out}`);
   }
 }
 
@@ -856,6 +887,7 @@ function buildStatus() {
         offset: p.offset || 0,
         total,
         done: Boolean(p.done),
+        incomplete: Boolean(p.incomplete),
         updated: p.updated || "",
       };
     });
@@ -884,6 +916,7 @@ function buildStatus() {
     restingUntil: t.restingUntil,
     etaHours: +etaHours.toFixed(1),
     etaIncomplete: datasets.some((d) => !d.planned), // some datasets not sized yet
+    rawDatasets: rawDatasets(),
     datasets,
     logs: STATUS.logs.slice(-40),
   };
@@ -945,6 +978,12 @@ const STATUS_PAGE = `<!doctype html>
       <thead><tr><th>Found</th><th>Company</th><th>District</th><th>State</th><th>Pincode</th><th>Activity</th><th>Why matched</th></tr></thead>
       <tbody id="leads"></tbody>
     </table></div>
+  </div>
+
+  <div class="card section">
+    <h2>All companies saved so far <span class="muted">(relevant + not relevant)</span></h2>
+    <div class="muted" style="margin-bottom:10px">Compressed CSV (.csv.gz): unzip with 7-Zip. Large files won't fit in Excel (about 10 lakh rows max).</div>
+    <div class="toolbar" id="raw-downloads"></div>
   </div>
 
   <div class="card section"><h2>Recent log</h2><pre id="log"></pre></div>
@@ -1014,11 +1053,19 @@ async function refresh() {
         const jp = j.total ? (j.offset / j.total) * 100 : 0;
         tr.append(el("td", j.label), el("td", fmt(j.offset), "num"), el("td", fmt(j.total), "num"),
           el("td", j.done ? "100%" : jp.toFixed(1) + "%", "num"),
-          el("td", j.done ? "done" : j.offset ? "in progress" : "waiting"));
+          el("td", j.done ? "done" : j.incomplete ? "incomplete (retries on restart)" : j.offset ? "in progress" : "waiting"));
         t.append(tr);
       }
       box.append(t); ds.append(box);
     }
+    const rawBox = document.getElementById("raw-downloads");
+    rawBox.replaceChildren();
+    for (const r of s.rawDatasets || []) {
+      const a = el("a", "Download " + r.label, "btn");
+      a.href = "all-companies.csv.gz?dataset=" + encodeURIComponent(r.resource);
+      rawBox.append(a);
+    }
+    if (!rawBox.children.length) rawBox.append(el("span", "Nothing saved yet.", "muted"));
     document.getElementById("log").textContent = s.logs.join("\\n");
 
     const more = await (await fetch("api/leads?from=" + leads.length, { cache: "no-store" })).json();
@@ -1053,6 +1100,7 @@ function startStatusServer(c) {
     res.end(body);
   };
 
+  let rawDownloadBusy = false; // one full download at a time, so the scan keeps its speed
   const server = http.createServer((req, res) => {
     if (!authorised(req)) {
       return send(res, 401, "text/plain", "Login required", { "WWW-Authenticate": 'Basic realm="Leads bot", charset="UTF-8"' });
@@ -1073,6 +1121,23 @@ function startStatusServer(c) {
         if (!fs.existsSync(f)) return send(res, 404, "text/plain", "No leads yet");
         return send(res, 200, "text/csv; charset=utf-8", fs.readFileSync(f),
           { "Content-Disposition": `attachment; filename="${files[url.pathname]}"` });
+      }
+      if (url.pathname === "/all-companies.csv.gz") {
+        const dataset = rawDatasets().find((d) => d.resource === url.searchParams.get("dataset"));
+        if (!dataset) return send(res, 404, "text/plain", "Nothing saved for that dataset");
+        if (rawDownloadBusy) return send(res, 429, "text/plain", "Another full download is running. Try again when it finishes.");
+        rawDownloadBusy = true;
+        const name = `all_companies_${dataset.label.replace(/[^a-z0-9]+/gi, "_")}.csv.gz`;
+        res.writeHead(200, {
+          "Content-Type": "application/gzip",
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+          "X-Frame-Options": "DENY",
+        });
+        pipeline(Readable.from(rawCsvChunks(dataset.resource)), zlib.createGzip({ level: 6 }), res)
+          .catch((e) => log(`Full download stopped: ${e.message}`))
+          .finally(() => { rawDownloadBusy = false; });
+        return;
       }
       send(res, 404, "text/plain", "Not found");
     } catch (e) {
@@ -1185,6 +1250,7 @@ async function main() {
     writeJson(pendingFile, pending);
   };
 
+  let incompleteParts = 0;
   for (const resource of c.resources) {
     let jobs;
     STATUS.phase = "planning";
@@ -1201,13 +1267,19 @@ async function main() {
       const key = jobKey(c, resource, filters);
       if (c.reset) delete progress[key];
       const saved = progress[key] || { offset: 0, done: false };
-      if (saved.done) { log(`Already finished: ${JSON.stringify(filters)}.`); continue; }
+      // Older versions could mark a part finished after an empty reply from the API.
+      // If it stopped short of its total, reopen it from where it stopped.
+      const stoppedShort = saved.done && saved.total && (saved.offset || 0) < saved.total;
+      if (stoppedShort) log(`Reopening ${JSON.stringify(filters)}: it stopped at ${saved.offset} of ${saved.total}.`);
+      if (saved.done && !stoppedShort) { log(`Already finished: ${JSON.stringify(filters)}.`); continue; }
       let offset = saved.offset || 0;
       const end = c.max === Infinity ? Infinity : offset + c.max;
       const label = Object.keys(filters).length ? JSON.stringify(filters) : "all of India";
       log(`Job ${label}: starting at record ${offset.toLocaleString("en-IN")}.`);
 
       let total = null;
+      let emptyReplies = 0;
+      let incomplete = false;
       STATUS.phase = "scanning";
       STATUS.current = { resource, label, offset, total: null };
       try {
@@ -1217,7 +1289,20 @@ async function main() {
           if (total === null) total = Number(data.total) || 0;
           STATUS.current.total = total;
           const records = data.records || [];
-          if (!records.length) break;
+          if (!records.length) {
+            // Empty before the reported total: never treat that as "finished".
+            if (total && offset < total) {
+              if (++emptyReplies <= EMPTY_PAGE_RETRIES) {
+                log(`  Empty reply at record ${offset} of ${total}. Retry ${emptyReplies}/${EMPTY_PAGE_RETRIES} in ${EMPTY_PAGE_WAIT_MS / 1000} s.`);
+                await sleep(EMPTY_PAGE_WAIT_MS);
+                continue;
+              }
+              incomplete = true;
+              log(`  INCOMPLETE: still empty at record ${offset} of ${total}. Moving on; a restart retries from here.`);
+            }
+            break;
+          }
+          emptyReplies = 0;
 
           const fresh = [];
           for (const rec of records) {
@@ -1260,20 +1345,21 @@ async function main() {
         throw e;
       }
 
-      const finished = c.max === Infinity;
-      progress[key] = { offset, done: finished, total, updated: nowIST() };
+      const finished = c.max === Infinity && !incomplete;
+      if (incomplete) incompleteParts++;
+      progress[key] = { offset, done: finished, incomplete, total, updated: nowIST() };
       const hadLeads = unsaved;
       saveFiles();
       if (hadLeads) await flushSheet();
-      log(finished ? `Finished ${label}.` : `Stopped at --max for ${label}.`);
+      log(finished ? `Finished ${label}.` : incomplete ? `Incomplete: ${label}.` : `Stopped at --max for ${label}.`);
     }
   }
 
   await flushSheet();
   writeOutputs(c.profile, leads);
-  log(`All jobs done. ${leads.length} lead(s) in output/${c.profile}_leads.csv` +
+  log(`${incompleteParts ? `Finished with ${incompleteParts} INCOMPLETE part(s); pm2 restart leads-bot retries them.` : "All jobs done."} ${leads.length} lead(s) in output/${c.profile}_leads.csv` +
     (pending.length ? `, ${pending.length} still waiting to be sent to the sheet.` : "."));
-  STATUS.phase = "done";
+  STATUS.phase = incompleteParts ? `${incompleteParts} part(s) incomplete: restart to retry` : "done";
   STATUS.current = null;
   if (STATUS.server) log("Status page keeps running. Stop with Ctrl+C.");
 }
@@ -1288,8 +1374,8 @@ process.on("SIGINT", stop);
 process.on("SIGTERM", stop);
 
 if (require.main === module) {
-  if (process.argv.includes("--export-raw")) { exportRaw(); process.exit(0); }
-  main().catch((e) => {
+  const run = process.argv.includes("--export-raw") ? exportRaw().then(() => process.exit(0)) : main();
+  run.catch((e) => {
     console.error(e);
     process.exit(1);
   });

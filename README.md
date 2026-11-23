@@ -43,7 +43,8 @@ Every page downloaded is also saved, unfiltered and gzipped, in `state/raw/`.
 Changing `PROFILE` (or `--reset`) re-scans from these files without calling
 data.gov.in again. To get everything stored as CSV:
 `node fetch-companies.js --export-raw` (writes `output/raw_<dataset>.csv`; MSME is
-far too big for Excel). Saving stops by itself if the disk has under 2 GB free;
+far too big for Excel), or use the **Download** buttons under "All companies saved
+so far" on the status page (compressed `.csv.gz`, one dataset at a time). Saving stops by itself if the disk has under 2 GB free;
 `RAW_STORE=off` turns it off.
 
 ## Files
