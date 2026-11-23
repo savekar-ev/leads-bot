@@ -622,11 +622,7 @@ function csvCell(v) {
   if (/^[=+\-@]/.test(s)) s = `'${s}`; // stop spreadsheets treating text as a formula
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
-function writeCsv(file, cols, rows) {
-  const lines = [cols.map(csvCell).join(",")];
-  for (const r of rows) lines.push(cols.map((c) => csvCell(r[c])).join(","));
-  fs.writeFileSync(file, "﻿" + lines.join("\r\n"), "utf8");
-}
+const csvLine = (cols, row) => cols.map((c) => csvCell(row[c])).join(",") + "\r\n";
 
 const LEGAL_SUFFIX =
   /\b(private limited|pvt\.? ltd\.?|pvt limited|private ltd\.?|limited|ltd\.?|llp|\(opc\)|opc|india)\s*$/i;
@@ -640,28 +636,286 @@ function cleanName(name) {
   return n === n.toUpperCase() ? n.toLowerCase().replace(/\b\w/g, (ch) => ch.toUpperCase()) : n;
 }
 
-function writeOutputs(profileName, leads) {
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  writeCsv(path.join(OUT_DIR, `${profileName}_leads.csv`), LEAD_COLUMNS, leads);
+// LinkedIn Matched Audiences company list (check headers against LinkedIn's template).
+const LINKEDIN_COLUMNS = ["companyname", "companywebsite", "companyemaildomain",
+  "linkedincompanypageurl", "city", "state", "companycountry"];
+function linkedinRow(l, names) {
+  const name = cleanName(l.Company);
+  if (!name || names.has(name.toLowerCase())) return null;
+  names.add(name.toLowerCase());
+  const email = (l.Email || "").toLowerCase();
+  const dom = email.includes("@") ? email.split("@")[1] : "";
+  const site = FREE_MAIL.has(dom) ? "" : dom;
+  return {
+    companyname: name, companywebsite: site, companyemaildomain: site,
+    linkedincompanypageurl: "", city: l.District, state: l.State, companycountry: "India",
+  };
+}
 
-  // LinkedIn Matched Audiences company list (check headers against LinkedIn's template).
-  const cols = ["companyname", "companywebsite", "companyemaildomain",
-    "linkedincompanypageurl", "city", "state", "companycountry"];
-  const seen = new Set();
-  const rows = [];
-  for (const l of leads) {
-    const name = cleanName(l.Company);
-    if (!name || seen.has(name.toLowerCase())) continue;
-    seen.add(name.toLowerCase());
-    const email = (l.Email || "").toLowerCase();
-    const dom = email.includes("@") ? email.split("@")[1] : "";
-    const site = FREE_MAIL.has(dom) ? "" : dom;
-    rows.push({
-      companyname: name, companywebsite: site, companyemaildomain: site,
-      linkedincompanypageurl: "", city: l.District, state: l.State, companycountry: "India",
-    });
+// ---------------------------------------------------------------------------
+// Lead storage: one lead per line, only ever appended to
+// ---------------------------------------------------------------------------
+// state/<profile>_leads.jsonl is the master list. Saving adds the new lines, so its
+// cost doesn't grow with the list and the leads don't have to stay in memory (only
+// a duplicate-check key per lead and the newest few for the status page do).
+
+// Reads a big JSON array of objects (the old leads format) one object at a time.
+async function* jsonArrayItems(file) {
+  let depth = 0, inString = false, escaped = false, parts = [];
+  for await (const chunk of fs.createReadStream(file, { encoding: "utf8", highWaterMark: 1 << 20 })) {
+    let start = depth > 0 ? 0 : -1;
+    for (let i = 0; i < chunk.length; i++) {
+      const ch = chunk.charCodeAt(i);
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === 92) escaped = true; // backslash
+        else if (ch === 34) inString = false; // quote
+      } else if (ch === 34) inString = true;
+      else if (ch === 123) { if (depth++ === 0) start = i; } // {
+      else if (ch === 125 && --depth === 0) { // }
+        parts.push(chunk.slice(start, i + 1));
+        const text = parts.join("");
+        parts = [];
+        start = -1;
+        yield JSON.parse(text);
+      }
+    }
+    if (depth > 0) parts.push(chunk.slice(start));
   }
-  writeCsv(path.join(OUT_DIR, `${profileName}_linkedin_upload.csv`), cols, rows);
+}
+
+async function* jsonlItems(file) {
+  if (!fs.existsSync(file)) return;
+  let rest = "";
+  for await (const chunk of fs.createReadStream(file, { encoding: "utf8", highWaterMark: 1 << 20 })) {
+    const lines = (rest + chunk).split("\n");
+    rest = lines.pop();
+    for (const line of lines) {
+      if (!line) continue;
+      let item;
+      try { item = JSON.parse(line); } catch { log("Skipped one damaged line in " + path.basename(file)); continue; }
+      yield item;
+    }
+  }
+}
+
+// A crash in the middle of a write can leave half a line at the end: remove it.
+function repairJsonlTail(file) {
+  if (!fs.existsSync(file)) return;
+  const size = fs.statSync(file).size;
+  if (!size) return;
+  const fd = fs.openSync(file, "r+");
+  try {
+    const one = Buffer.alloc(1);
+    fs.readSync(fd, one, 0, 1, size - 1);
+    if (one[0] === 10) return;
+    const block = Buffer.alloc(64 * 1024);
+    let end = size;
+    while (end > 0) {
+      const from = Math.max(0, end - block.length);
+      const n = fs.readSync(fd, block, 0, end - from, from);
+      const nl = block.subarray(0, n).lastIndexOf(10);
+      if (nl >= 0) { fs.ftruncateSync(fd, from + nl + 1); return; }
+      end = from;
+    }
+    fs.ftruncateSync(fd, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Copies an old JSON array to the line format. The old file is left in place.
+async function jsonToJsonl(from, to) {
+  const tmp = `${to}.tmp`;
+  const fd = fs.openSync(tmp, "w");
+  let buf = "", n = 0;
+  try {
+    for await (const item of jsonArrayItems(from)) {
+      buf += JSON.stringify(item) + "\n";
+      n++;
+      if (buf.length > 1 << 20) { fs.writeFileSync(fd, buf); buf = ""; }
+    }
+    fs.writeFileSync(fd, buf);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, to);
+  return n;
+}
+
+function bufferedWriter(file, first) {
+  const fd = fs.openSync(file, "w");
+  let buf = first;
+  return {
+    write(text) {
+      buf += text;
+      if (buf.length > 1 << 20) { fs.writeFileSync(fd, buf); buf = ""; }
+    },
+    close() { fs.writeFileSync(fd, buf); fs.closeSync(fd); },
+  };
+}
+
+const RECENT_LEADS = 2000; // newest leads kept in memory for the status page
+
+class LeadStore {
+  constructor(profileName) {
+    this.profile = profileName;
+    this.file = path.join(STATE_DIR, `${profileName}_leads.jsonl`);
+    this.oldFile = path.join(STATE_DIR, `${profileName}_leads.json`);
+    this.csv = path.join(OUT_DIR, `${profileName}_leads.csv`);
+    this.linkedin = path.join(OUT_DIR, `${profileName}_linkedin_upload.csv`);
+    this.keys = new Set();
+    this.names = new Set();
+    this.unsaved = [];
+    this.recent = [];
+    this.count = 0;
+    this.backingUp = false;
+  }
+
+  remember(lead) {
+    this.count++;
+    this.recent.push(lead);
+    if (this.recent.length > RECENT_LEADS * 2) this.recent.splice(0, this.recent.length - RECENT_LEADS);
+  }
+
+  // Reads the list once at start and rebuilds the CSVs from it.
+  async open() {
+    fs.mkdirSync(OUT_DIR, { recursive: true });
+    if (!fs.existsSync(this.file) && fs.existsSync(this.oldFile)) {
+      const n = await jsonToJsonl(this.oldFile, this.file);
+      log(`Moved ${n} lead(s) to ${path.basename(this.file)}. The old ${path.basename(this.oldFile)} is kept unchanged.`);
+    }
+    repairJsonlTail(this.file);
+
+    const csvTmp = `${this.csv}.tmp`, linkedinTmp = `${this.linkedin}.tmp`;
+    const csv = bufferedWriter(csvTmp, "﻿" + LEAD_COLUMNS.map(csvCell).join(",") + "\r\n");
+    const linkedin = bufferedWriter(linkedinTmp, "﻿" + LINKEDIN_COLUMNS.map(csvCell).join(",") + "\r\n");
+    for await (const lead of jsonlItems(this.file)) {
+      const k = leadKey(lead);
+      if (this.keys.has(k)) continue;
+      this.keys.add(k);
+      this.remember(lead);
+      csv.write(csvLine(LEAD_COLUMNS, lead));
+      const row = linkedinRow(lead, this.names);
+      if (row) linkedin.write(csvLine(LINKEDIN_COLUMNS, row));
+    }
+    csv.close();
+    linkedin.close();
+    if (this.count) {
+      fs.renameSync(csvTmp, this.csv);
+      fs.renameSync(linkedinTmp, this.linkedin);
+    } else {
+      fs.rmSync(csvTmp, { force: true });
+      fs.rmSync(linkedinTmp, { force: true });
+    }
+  }
+
+  has(key) { return this.keys.has(key); }
+
+  add(lead, key) {
+    this.keys.add(key);
+    this.remember(lead);
+    this.unsaved.push(lead);
+  }
+
+  // Master list first. If a crash hits after it, the CSVs are rebuilt on the next start.
+  flush() {
+    if (!this.unsaved.length) return;
+    let lines = "", csv = "", linkedin = "";
+    for (const lead of this.unsaved) {
+      lines += JSON.stringify(lead) + "\n";
+      csv += csvLine(LEAD_COLUMNS, lead);
+      const row = linkedinRow(lead, this.names);
+      if (row) linkedin += csvLine(LINKEDIN_COLUMNS, row);
+    }
+    fs.appendFileSync(this.file, lines);
+    this.unsaved = [];
+    if (!fs.existsSync(this.csv)) fs.writeFileSync(this.csv, "﻿" + LEAD_COLUMNS.map(csvCell).join(",") + "\r\n");
+    if (!fs.existsSync(this.linkedin)) fs.writeFileSync(this.linkedin, "﻿" + LINKEDIN_COLUMNS.map(csvCell).join(",") + "\r\n");
+    fs.appendFileSync(this.csv, csv);
+    if (linkedin) fs.appendFileSync(this.linkedin, linkedin);
+  }
+
+  // One gzipped copy per day in state/backups, kept forever. Runs in the background.
+  async backup() {
+    if (this.backingUp || !fs.existsSync(this.file)) return;
+    const dir = path.join(STATE_DIR, "backups");
+    const day = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+    const target = path.join(dir, `${this.profile}_leads_${day}.jsonl.gz`);
+    if (fs.existsSync(target)) return;
+    const size = fs.statSync(this.file).size;
+    if (!size) return;
+    this.backingUp = true;
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      await pipeline(fs.createReadStream(this.file, { end: size - 1 }), zlib.createGzip(), fs.createWriteStream(`${target}.tmp`));
+      fs.renameSync(`${target}.tmp`, target);
+    } catch (e) {
+      log(`Backup failed (${e.message}); the main leads file is unaffected.`);
+    } finally {
+      this.backingUp = false;
+    }
+  }
+}
+
+// Leads waiting for the Google Sheet, on disk so a long Sheet outage can't fill memory.
+class SheetQueue {
+  constructor() {
+    this.file = path.join(STATE_DIR, "sheet_pending.jsonl");
+    this.posFile = path.join(STATE_DIR, "sheet_pending_position.json");
+    this.oldFile = path.join(STATE_DIR, "sheet_pending.json");
+    this.offset = 0;
+    this.count = 0;
+  }
+
+  async open() {
+    if (fs.existsSync(this.oldFile)) {
+      if (!fs.existsSync(this.file)) await jsonToJsonl(this.oldFile, this.file);
+      fs.renameSync(this.oldFile, `${this.oldFile}.migrated`);
+    }
+    repairJsonlTail(this.file);
+    if (!fs.existsSync(this.file)) return;
+    const size = fs.statSync(this.file).size;
+    this.offset = Number(readJson(this.posFile, {}).offset) || 0;
+    if (this.offset > size) this.offset = 0;
+    if (this.offset === size) return;
+    for await (const chunk of fs.createReadStream(this.file, { start: this.offset })) {
+      for (let i = chunk.indexOf(10); i >= 0; i = chunk.indexOf(10, i + 1)) this.count++;
+    }
+  }
+
+  add(leads) {
+    fs.appendFileSync(this.file, leads.map((l) => JSON.stringify(l) + "\n").join(""));
+    this.count += leads.length;
+  }
+
+  next(max) {
+    const buf = Buffer.alloc(4 * 1024 * 1024);
+    const fd = fs.openSync(this.file, "r");
+    let got;
+    try { got = fs.readSync(fd, buf, 0, buf.length, this.offset); } finally { fs.closeSync(fd); }
+    const rows = [];
+    let bytes = 0, lines = 0;
+    while (lines < max) {
+      const nl = buf.indexOf(10, bytes);
+      if (nl < 0 || nl >= got) break;
+      try { rows.push(JSON.parse(buf.toString("utf8", bytes, nl))); } catch { /* damaged line: skip */ }
+      bytes = nl + 1;
+      lines++;
+    }
+    return { rows, bytes, lines };
+  }
+
+  done({ bytes, lines }) {
+    this.offset += bytes;
+    this.count = Math.max(0, this.count - lines);
+    if (this.offset >= fs.statSync(this.file).size) {
+      fs.truncateSync(this.file, 0);
+      this.offset = 0;
+      this.count = 0;
+    }
+    writeJson(this.posFile, { offset: this.offset });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -780,24 +1034,6 @@ class WebhookSheet {
 }
 
 // ---------------------------------------------------------------------------
-// Backups: one gzipped copy of the leads file per day in state/backups, kept
-// forever (nothing is ever deleted), so even a deleted or damaged leads file can
-// be restored. Older plain .json backups are left as they are.
-// ---------------------------------------------------------------------------
-function backupLeads(profileName, leadsFile) {
-  try {
-    const dir = path.join(STATE_DIR, "backups");
-    fs.mkdirSync(dir, { recursive: true });
-    const day = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
-    const file = path.join(dir, `${profileName}_leads_${day}.json.gz`);
-    fs.writeFileSync(`${file}.tmp`, zlib.gzipSync(fs.readFileSync(leadsFile)));
-    fs.renameSync(`${file}.tmp`, file);
-  } catch (e) {
-    log(`Backup failed (${e.message}); the main leads file is unaffected.`);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Planning: which jobs to run for each dataset
 // ---------------------------------------------------------------------------
 const jobKey = (c, resource, filters) => {
@@ -868,7 +1104,7 @@ async function planJobs(c, throttle, resource) {
 // (browser login box, user name STATUS_USER, default "admin").
 //   /               the page (refreshes itself every 15 s)
 //   /api/status     progress as JSON
-//   /api/leads?from=N  leads from number N on
+//   /api/leads?from=N  newest leads after number N
 //   /leads.csv, /linkedin.csv  downloads
 function buildStatus() {
   const c = STATUS.config;
@@ -907,8 +1143,8 @@ function buildStatus() {
     phase: STATUS.phase,
     profile: c.profile,
     current: STATUS.current,
-    leads: STATUS.leads.length,
-    pendingSheet: readJson(path.join(STATE_DIR, "sheet_pending.json"), []).length,
+    leads: STATUS.store.count,
+    pendingSheet: STATUS.sheetQueue.count,
     requestsToday: t.day.count,
     maxPerDay: c.maxPerDay,
     secondsBetweenRequests: +(t.gap / 1000).toFixed(1),
@@ -992,6 +1228,7 @@ const STATUS_PAGE = `<!doctype html>
 const fmt = (n) => n == null ? "?" : Number(n).toLocaleString("en-IN");
 const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
 const leads = [];
+let leadTotal = 0;
 
 function bar(pct, done) {
   const b = el("div", null, "bar" + (done ? " done" : ""));
@@ -1008,8 +1245,9 @@ function renderLeads() {
     for (const k of ["Found at (IST)", "Company", "District", "State", "Pincode", "Activity", "Why matched"]) tr.append(el("td", l[k] || ""));
     body.append(tr);
   }
-  document.getElementById("lead-count").textContent =
-    "(" + fmt(shown.length) + (q ? " matching" : "") + (shown.length > 2000 ? ", newest 2,000 shown" : "") + ")";
+  document.getElementById("lead-count").textContent = q
+    ? "(" + fmt(shown.length) + " matching in the newest " + fmt(leads.length) + ")"
+    : "(" + fmt(leadTotal) + (leadTotal > leads.length ? ", newest " + fmt(leads.length) + " shown" : "") + ")";
 }
 
 async function refresh() {
@@ -1068,9 +1306,11 @@ async function refresh() {
     if (!rawBox.children.length) rawBox.append(el("span", "Nothing saved yet.", "muted"));
     document.getElementById("log").textContent = s.logs.join("\\n");
 
-    const more = await (await fetch("api/leads?from=" + leads.length, { cache: "no-store" })).json();
+    const more = await (await fetch("api/leads?from=" + leadTotal, { cache: "no-store" })).json();
     if (more.reset) leads.length = 0;
     leads.push(...more.leads);
+    if (leads.length > 2000) leads.splice(0, leads.length - 2000);
+    leadTotal = more.total;
     renderLeads();
   } catch (e) {
     document.getElementById("sub").textContent = "Can't reach the bot (" + e.message + "). Retrying…";
@@ -1111,16 +1351,24 @@ function startStatusServer(c) {
       if (url.pathname === "/api/status") return send(res, 200, "application/json", JSON.stringify(buildStatus()));
       if (url.pathname === "/api/leads") {
         const from = Math.max(0, parseInt(url.searchParams.get("from") || "0", 10));
-        const all = STATUS.leads;
-        const reset = from > all.length; // e.g. after --reset
-        return send(res, 200, "application/json", JSON.stringify({ reset, leads: all.slice(reset ? 0 : from) }));
+        const { count, recent } = STATUS.store;
+        const firstKept = count - recent.length;
+        const reset = from > count || from < firstKept; // first load, or after --reset
+        const newest = reset ? recent.slice(-RECENT_LEADS) : recent.slice(from - firstKept);
+        return send(res, 200, "application/json", JSON.stringify({ reset, total: count, leads: newest }));
       }
       const files = { "/leads.csv": `${c.profile}_leads.csv`, "/linkedin.csv": `${c.profile}_linkedin_upload.csv` };
       if (files[url.pathname]) {
         const f = path.join(OUT_DIR, files[url.pathname]);
         if (!fs.existsSync(f)) return send(res, 404, "text/plain", "No leads yet");
-        return send(res, 200, "text/csv; charset=utf-8", fs.readFileSync(f),
-          { "Content-Disposition": `attachment; filename="${files[url.pathname]}"` });
+        res.writeHead(200, {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${files[url.pathname]}"`,
+          "Cache-Control": "no-store",
+          "X-Frame-Options": "DENY",
+        });
+        pipeline(fs.createReadStream(f), res).catch((e) => log(`Download stopped: ${e.message}`));
+        return;
       }
       if (url.pathname === "/all-companies.csv.gz") {
         const dataset = rawDatasets().find((d) => d.resource === url.searchParams.get("dataset"));
@@ -1160,39 +1408,40 @@ async function main() {
   const throttle = new Throttle(c);
 
   const progressFile = path.join(STATE_DIR, "progress.json");
-  const leadsFile = path.join(STATE_DIR, `${c.profile}_leads.json`);
-  const pendingFile = path.join(STATE_DIR, "sheet_pending.json");
   const progress = readJson(progressFile, {});
-  const leads = readJson(leadsFile, []);
-  let pending = readJson(pendingFile, []);
-  const seen = new Set(leads.map(leadKey));
+  log("Loading saved leads...");
+  const store = new LeadStore(c.profile);
+  await store.open();
+  const sheetQueue = new SheetQueue();
+  await sheetQueue.open();
 
   // Nothing found earlier is lost when switching profile: the broad profile
   // covers every other one, so leads found before with cpo / ev / energy are
-  // carried into the broad files (once, de-duplicated). The old files are left
+  // carried into the broad list (once, de-duplicated). The old files are left
   // untouched. They were already sent to the Google Sheet, so not sent again.
   if (c.profile === "broad") {
     let carried = 0;
     for (const f of fs.readdirSync(STATE_DIR)) {
-      const m = f.match(/^(.+)_leads\.json$/);
+      const m = f.match(/^(.+)_leads\.(json|jsonl)$/);
       if (!m || m[1] === "broad" || m[1] === "raw") continue;
-      for (const l of readJson(path.join(STATE_DIR, f), [])) {
+      const file = path.join(STATE_DIR, f);
+      for await (const l of m[2] === "json" ? jsonArrayItems(file) : jsonlItems(file)) {
         const k = leadKey(l);
-        if (seen.has(k)) continue;
-        seen.add(k);
-        leads.push(l);
+        if (store.has(k)) continue;
+        store.add(l, k);
         carried++;
+        if (store.unsaved.length >= 1000) store.flush();
       }
     }
-    if (carried) {
-      writeJson(leadsFile, leads);
-      writeOutputs(c.profile, leads);
-      log(`Carried ${carried} earlier lead(s) (from other profiles) into ${c.profile}_leads.`);
-    }
+    store.flush();
+    if (carried) log(`Carried ${carried} earlier lead(s) (from other profiles) into ${c.profile}_leads.`);
   }
+  store.backup();
+  log(`${store.count.toLocaleString("en-IN")} saved lead(s) loaded.`);
   STATUS.config = c;
   STATUS.throttle = throttle;
-  STATUS.leads = leads;
+  STATUS.store = store;
+  STATUS.sheetQueue = sheetQueue;
   startStatusServer(c);
 
   log(`Profile "${c.profile}", datasets: ${c.resources.join(", ")}`);
@@ -1214,40 +1463,28 @@ async function main() {
     log("No Google Sheet set: leads are saved to ./output only.");
   }
 
-  // Saving: leads first, then progress (so progress never runs ahead of saved
-  // leads). With many leads (broad profile) rewriting the files after every page
-  // gets slow, so new leads are saved at most once a minute; pages scanned since
-  // the last save are simply scanned again after a crash (from state/raw, free).
-  const SAVE_EVERY_MS = 60 * 1000;
-  let unsaved = false;
-  let lastSave = Date.now();
-  const saveFiles = () => {
-    if (unsaved) {
-      writeJson(leadsFile, leads);
-      backupLeads(c.profile, leadsFile);
-      writeJson(pendingFile, pending);
-      writeOutputs(c.profile, leads);
-      unsaved = false;
-    }
-    writeJson(progressFile, progress);
-    lastSave = Date.now();
-  };
-  saveOnExit = saveFiles;
+  // Saving: new leads are appended after every page, then progress moves on (so
+  // progress never runs ahead of saved leads). The Sheet is updated once a minute.
+  const saveProgress = () => writeJson(progressFile, progress);
+  saveOnExit = saveProgress;
 
+  const SHEET_EVERY_MS = 60 * 1000;
+  let lastSheetFlush = 0;
   const flushSheet = async () => {
-    if (!sheet.enabled || !pending.length) return;
+    lastSheetFlush = Date.now();
+    if (!sheet.enabled || !sheetQueue.count) return;
     try {
       // Sheets accepts large batches; send at most 500 rows per call.
-      while (pending.length) {
-        const batch = pending.slice(0, 500);
-        await sheet.append(batch);
-        pending = pending.slice(batch.length);
-        log(`Added ${batch.length} lead(s) to Google Sheet.`);
+      while (sheetQueue.count) {
+        const batch = sheetQueue.next(500);
+        if (!batch.lines) break;
+        await sheet.append(batch.rows);
+        sheetQueue.done(batch);
+        log(`Added ${batch.rows.length} lead(s) to Google Sheet.`);
       }
     } catch (e) {
       log(`Could not write to Google Sheet (${e.message}); will retry with the next batch.`);
     }
-    writeJson(pendingFile, pending);
   };
 
   let incompleteParts = 0;
@@ -1312,33 +1549,31 @@ async function main() {
             if (!reasons.length) continue;
             const lead = toLead(rec, reasons, resource);
             const k = leadKey(lead);
-            if (seen.has(k)) continue;
-            seen.add(k);
+            if (store.has(k)) continue;
+            store.add(lead, k);
             fresh.push(lead);
           }
 
           offset += records.length;
           if (fresh.length) {
-            leads.push(...fresh);
-            if (sheet.enabled) pending.push(...fresh);
-            unsaved = true;
+            // Queue first: a crash here can repeat a Sheet row but never lose one.
+            if (sheet.enabled) sheetQueue.add(fresh);
+            store.flush();
             for (const l of fresh) {
               log(`  NEW LEAD: ${l.Company} (${[l.District, l.State].filter(Boolean).join(", ") || "?"}) ${l["Why matched"]}`);
             }
           }
           progress[key] = { offset, done: false, total, updated: nowIST() };
-          if (!unsaved || Date.now() - lastSave >= SAVE_EVERY_MS) {
-            const hadLeads = unsaved;
-            saveFiles();
-            if (hadLeads) await flushSheet();
-          }
+          saveProgress();
+          store.backup();
+          if (Date.now() - lastSheetFlush >= SHEET_EVERY_MS) await flushSheet();
           STATUS.current.offset = offset;
 
           const pct = total ? ((offset / total) * 100).toFixed(2) : "?";
           const pagesLeft = total ? Math.ceil((total - offset) / c.pageSize) : 0;
           const hoursLeft = (pagesLeft * (throttle.gap / 1000 + 2)) / 3600;
           log(`  ${label}: ${offset.toLocaleString("en-IN")} of ${total.toLocaleString("en-IN")} (${pct}%)` +
-            `${cached ? " [from state/raw]" : ""}, leads so far ${leads.length}, ~${hoursLeft.toFixed(1)} h left in this job`);
+            `${cached ? " [from state/raw]" : ""}, leads so far ${store.count}, ~${hoursLeft.toFixed(1)} h left in this job`);
         }
       } catch (e) {
         if (e instanceof SkipResource) { log(`Skipping rest of dataset: ${e.message}`); break; }
@@ -1348,23 +1583,25 @@ async function main() {
       const finished = c.max === Infinity && !incomplete;
       if (incomplete) incompleteParts++;
       progress[key] = { offset, done: finished, incomplete, total, updated: nowIST() };
-      const hadLeads = unsaved;
-      saveFiles();
-      if (hadLeads) await flushSheet();
+      saveProgress();
+      await flushSheet();
       log(finished ? `Finished ${label}.` : incomplete ? `Incomplete: ${label}.` : `Stopped at --max for ${label}.`);
     }
   }
 
   await flushSheet();
-  writeOutputs(c.profile, leads);
-  log(`${incompleteParts ? `Finished with ${incompleteParts} INCOMPLETE part(s); pm2 restart leads-bot retries them.` : "All jobs done."} ${leads.length} lead(s) in output/${c.profile}_leads.csv` +
-    (pending.length ? `, ${pending.length} still waiting to be sent to the sheet.` : "."));
+  log(`${incompleteParts ? `Finished with ${incompleteParts} INCOMPLETE part(s); pm2 restart leads-bot retries them.` : "All jobs done."} ${store.count} lead(s) in output/${c.profile}_leads.csv` +
+    (sheetQueue.count ? `, ${sheetQueue.count} still waiting to be sent to the sheet.` : "."));
   STATUS.phase = incompleteParts ? `${incompleteParts} part(s) incomplete: restart to retry` : "done";
   STATUS.current = null;
   if (STATUS.server) log("Status page keeps running. Stop with Ctrl+C.");
+  process.exitCode = EXIT_FINISHED;
 }
 
-let saveOnExit = null; // set by main(): writes unsaved leads + progress
+// pm2 can report a crash (out of memory, SIGABRT) as "code 0", so a real finish has
+// its own exit code and only that one (or a config error) stops pm2 restarting it.
+const EXIT_FINISHED = 10;
+let saveOnExit = null; // set by main(): writes progress
 const stop = () => {
   try { if (saveOnExit) saveOnExit(); } catch (e) { console.error(`Save on stop failed: ${e.message}`); }
   log("Stopped (progress is saved).");

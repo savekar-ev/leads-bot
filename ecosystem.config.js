@@ -11,9 +11,10 @@ module.exports = {
       // Restart after a crash, waiting a bit longer each time (no tight loops)...
       autorestart: true,
       exp_backoff_restart_delay: 5000,
-      // ...but not after a clean finish (exit code 0) or a config error
+      // ...but not after a real finish (exit code 10) or a config error
       // (exit code 2, "CONFIG ERROR" in the log: fix .env, then pm2 restart).
-      stop_exit_codes: [0, 2],
+      // Don't list 0 here: pm2 can report a crash (SIGABRT) as code 0.
+      stop_exit_codes: [2, 10],
       max_memory_restart: "800M",
       kill_timeout: 5000, // lets it save progress on stop
       time: true,         // timestamps in pm2 logs

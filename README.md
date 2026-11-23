@@ -157,12 +157,14 @@ running after all datasets are done.
    **My IP** (or your office IP). Avoid `0.0.0.0/0` (the whole internet).
 4. Open `http://<instance-public-IP>:8080` and log in.
 
-**Where the data lives (no data loss):** every new lead is written to
-`state/cpo_leads.json` (written atomically, so a crash can't leave it half
-written) *before* anything else happens, and `output/cpo_leads.csv` is rebuilt
-from it. A gzipped copy is kept per day in `state/backups/` (never deleted). The page and
-the CSV buttons only read this data; they never change it. Leads survive
+**Where the data lives (no data loss):** every new lead is appended to
+`state/<profile>_leads.jsonl` (one lead per line) *before* progress moves on, then
+to `output/<profile>_leads.csv`. The CSVs are rebuilt from the master list at each
+start. An older `state/<profile>_leads.json` is copied into the new file once and
+left unchanged. A gzipped copy is kept per day in `state/backups/` (never deleted).
+The page and the CSV buttons only read this data; they never change it. Leads survive
 restarts, `git pull` and reboots; only deleting the `state/` folder removes them.
+The status page shows the newest 2,000 leads; download the CSV for the full list.
 
 The page is plain HTTP, so the password travels unencrypted. Keeping the
 security-group rule limited to your own IPs is what keeps it private. For HTTPS
